@@ -203,19 +203,22 @@ class ToneChannel(Channel):
             print(f"ch{self.channel}: Pause {frames} frames")
             self.waits -= frames * 735
             while frames > 0:
-                b = 0b11000000
-                if frames <= 32:
-                    b |= frames + 1
+                b = 0b00100000
+                if frames <= 31:
+                    # 1-byte count
+                    b |= frames
                     self.data.append(b)
                     frames = 0
-                elif frames <= 256:
+                elif frames <= 255 + 31:
+                    # 2-byte count
                     self.data.append(b)
-                    self.data.append(frames - 1)
+                    self.data.append(frames - 31)
                     frames = 0
                 else:
+                    # 2-byte max count and loop
                     self.data.append(b)
                     self.data.append(255)
-                    frames -= 256
+                    frames -= 255 + 31
 
 
 class RhythmChannel(Channel):
@@ -325,10 +328,19 @@ def convert(filename):
                 # TODO
                 pass
                 
+    # Terminate
+    for index in channels:
+        # Write any remaining waits
+        channels[index].write_data()
+        # Terminate with a zero length extended wait
+        channels[index].data.append(0b00100000)
+        channels[index].data.append(0b00000000)
+
     # Print some stuff
     for index in channels:
         print(f"ch{index} data = {len(channels[index].data)} bytes")
 
+    
 def main():
     verb = sys.argv[1]
     if verb == 'convert':
