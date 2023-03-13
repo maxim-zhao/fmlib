@@ -110,7 +110,6 @@ class ToneChannel(Channel):
         self.channel = index
         self.state = ToneState()
         self.last_state = ToneState()
-        self.raw = bytearray()
 
     def reg1x(self, b):
         self.maybe_write_data()
@@ -142,47 +141,37 @@ class ToneChannel(Channel):
         # If key has gone from down to up, we handle that first
         if (not self.state.key) and self.last_state.key:
             print(f"ch{self.channel}: Key up")
-            self.data.append(0b01000000)
+            self.data.append(0b10000000)
             self.last_state.key = self.state.key
-            # And we ignore any other changes... this is not quite VGM compatible
+            # And we ignore any other changes... this is not quite VGM compatible as we are delaying those changes to the next key down
             delta = 0
         else:
             # Check for a large f-num change or other change affecting block, key(, sustain)
-            if delta < -4 or delta > 4 or self.state.block != self.last_state.block or self.state.sustain != self.last_state.sustain or self.state.key != self.last_state.key:
+            if delta < -4 or delta > 4 or self.state.block != self.last_state.block or self.state.sustain != self.last_state.sustain or self.state.key != self.last_state.key or frames == 0:
                 print(f"ch{self.channel}: Changed from key {self.last_state.key}, sustain {self.last_state.sustain}, block {self.last_state.block}, f-num {self.last_state.fnum} to key {self.state.key}, sustain {self.state.sustain}, block {self.state.block}, f-num {self.state.fnum}")
-                b = 0b01100000
-                if self.state.key:
+                b = 0b01000000
+                if self.state.sustain:
                     b |= 0b00010000
-                #if self.sustain: TODO where does sustain go?!
-                #    b |= 0b00001000
                 b |= self.state.fnum >> 8
                 b |= self.state.block << 1
                 self.data.append(b)
                 self.data.append(self.state.fnum & 0xff)
                 # Remember the changes
                 self.last_state.key = self.state.key
-                #self.last_state.sustain = self.state.sustain TODO here too
+                self.last_state.sustain = self.state.sustain
                 self.last_state.block = self.state.block
                 self.last_state.fnum = self.state.fnum
                 # This captures 3 or 6 bytes of VGM to 2 bytes
             
             if self.state.volume != self.last_state.volume:
+                self.data.append(0b01100000 | self.state.volume)
+                self.last_state.volume = self.state.volume
                 print(f"ch{self.channel}: volume changed to {self.state.volume}")
             if self.state.instrument != self.last_state.instrument:
-                print(f"ch{self.channel}: instrument changed to {self.state.instrument}")
-            if self.state.volume != self.last_state.volume or self.state.instrument != self.last_state.instrument:
-                self.raw.append(0x30 + self.channel)
-                self.raw.append(self.state.instrument << 4 | self.state.volume)
-                self.last_state.volume = self.state.volume
+                self.data.append(0b01110000 | self.state.instrument)
                 self.last_state.instrument = self.state.instrument
-                # This captures 3 bytes of VGM to 3 bytes :( but it's pretty rare..?
-            
-        while len(self.raw) > 0:
-            count = len(self.raw) // 2 # Cannot be more than 32?
-            print(f"ch{self.channel}: Emitting {count} raw data pairs")
-            self.data.append(0b10000000 | count)
-            self.data += self.raw
-            self.raw = bytearray()
+                print(f"ch{self.channel}: instrument changed to {self.state.instrument}")
+            # These two will expand 3 bytes to 1 or 2 bytes of data
             
         if self.state.fnum != self.last_state.fnum:
             # Must be a small change left over from above, not accompanied by anything else important
@@ -193,7 +182,7 @@ class ToneChannel(Channel):
                 b |= 0b00010000
                 delta *= -1
             b |= delta << 2
-            b |= frames_to_consume # Consume up to 4 frames
+            b |= frames_to_consume - 1 # Consume up to 4 frames
             self.data.append(b)
             self.waits -= frames_to_consume * 735
             # This captures 4 bytes of VGM to 1 byte
@@ -219,39 +208,73 @@ class ToneChannel(Channel):
                     self.data.append(b)
                     self.data.append(255)
                     frames -= 255 + 31
-
+    def terminate(self):
+        self.data.append(0b11111111)
+    
 
 class RhythmChannel(Channel):
     def __init__(self):
         super().__init__()
         self.value = 0
         self.value_changed = False
+        self.custom_instrument = [0, 0, 0, 0, 0, 0, 0, 0]
+        self.custom_instrument_changed = False
         
     def write(self, data):
         self.maybe_write_data()
         self.value = data
         self.value_changed = True
         
+    def add_custom(self, index, data):
+        self.custom_instrument[index] = data
+        seld.custom_instrument_changed = True
+        
     def write_data(self):
+        frames = self.waits // 735
+        
+        if self.custom_instrument_changed:
+            print("Custom instrument changed")
+            
+            self.custom_instrument_changed = False
+        
         if self.value_changed:
-            print(f"Rhythm: value changed to {self.value:b}")
-            self.data.append(self.value & 0b00111111)
+            if frames <= 4:
+                print(f"Rhythm: value changed to {self.value:b}, then wait {frames} frames")
+                b = 0
+                b |= frames << 5
+                b |= self.value & 0b00011111
+                self.data.append(b)
+                frames = 0
+            else:
+                print(f"Rhythm: value changed to {self.value:b}")
+                b = 0b10000000
+                b |= self.value & 0b00011111
+                self.data.append(b)
             self.value_changed = False
             
-        if self.waits >= 735:
-            frames = self.waits // 735
+        if frames > 0:
             print(f"Rhythm: Pause {frames} frames")
             self.waits -= frames * 735
             while frames > 0:
                 b = 0b11000000
-                if frames <= 32:
-                    b |= frames + 1
+                if frames <= 63:
+                    # 1-byte count
+                    b |= frames
+                    self.data.append(b)
+                    frames = 0
+                elif frames <= 256 + 63:
+                    # 2-byte count
+                    self.data.append(b)
+                    self.data.append(frames - 63)
                     frames = 0
                 else:
-                    b |= 31
-                    frames -= 32
-                self.data.append(b)
+                    # 2-byte max count and loop
+                    self.data.append(b)
+                    self.data.append(255)
+                    frames -= 256 + 63
 
+    def terminate(self):
+        self.data.append(0b11111111)
 
 # FMLib format speculation:
 #
@@ -271,24 +294,32 @@ class RhythmChannel(Channel):
 # * Sustain seems likely to be changed less often than key
 # * Volume and instrument changes are rare
 # We therefore try to optimise for data as so:
-# 1. Small frequency changes (vibrato, +/- <16?)
-#    %000xxxyy = change F-num by x (1's-comp signed, -4..+4) and wait y+1 frames (max 4)
+# 1. Small frequency changes with small waits
+#    %00sxxyyy = change F-num by x+1, s = sign (1 -> -x, 0 -> +x) and wait y+1 frames (max 8)
 # 2. Waits
-#    %001xxxxx = wait x+1 frames, max 32
-#    %00100000 xxxxxxxx = wait x+1 frames, max 256
-# 3. Note changes + key
-#    %0100---- = key off
-#    %0101bbbx xxxxxxxx = block b, F-num x, key on
-# 4. Raw data
-#    %011nnnnn = n+1 register, data pairs - i.e. max 32 pairs, 64 bytes
-# For rhythm data, we can have a simpler format:
-# 1. Rhythm keys
-#    %00kkkkkk = value to write to rhythm control register
+#    %01xxxxxx = wait x frames, max 31
+#    %01000000 xxxxxxxx = wait x+32 frames, max 287
+# 3. Note changes or key change
+#    %010sbbbf ffffffff = block b, F-num f, implicit key on, sustain s
+#    %10000000 = key off, no change to anything else? Wastes some bits?
+#    %11111111 = end of stream
+# 4. Instrument or volume change
+#    %011txxxx = instrument (t=1) or volume (t=0) change to x
+# For rhythm data:
+# 1. Rhythm keys down
+#    %0nnkkkkk = write value k, rhythm enabled, pause n+1 frames (max 4)
+#    %100kkkkk = write value k, rhythm enabled
 # 2. Waits
-#    Same as above, or use extra bits?
-# TODO what about sustain?
+#    %11nnnnnn = pause n frames, max 63
+#    %11000000 xxxxxxxx = pause x+64 frames, max 319
+# 3. Custom instruments, end of stream
+#    %10100000 = end of stream
+#    %10100001 = emit next 8 bytes to registers 0..7
+# Missed compression bit here!
 # TODO what about custom instruments? -> raw data on a tone channel? But which one?
 # TODO support channel masking? Rhythm setup confuses this
+# TODO compression!
+# TODO looping
 
 def convert(filename):
     file = VgmFile(filename)
@@ -323,6 +354,9 @@ def convert(filename):
             elif line.register == 0x0e:
                 # rhythm
                 channels[9].write(line.data)
+            elif line.register <= 0x08:
+                # custom instrument
+                channels[9].add_custom(line.register, line.data)
             else:
                 # Something else
                 # TODO
@@ -332,9 +366,7 @@ def convert(filename):
     for index in channels:
         # Write any remaining waits
         channels[index].write_data()
-        # Terminate with a zero length extended wait
-        channels[index].data.append(0b00100000)
-        channels[index].data.append(0b00000000)
+        channels[index].terminate()
 
     # Print some stuff
     for index in channels:
