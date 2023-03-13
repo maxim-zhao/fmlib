@@ -78,6 +78,7 @@ class VgmFile:
 
 
 class Channel:
+    # This is a base for ToneChannel and RhythmChannel. It accumulates wait commands.
     def __init__(self):
         self.waits = 0
         self.data = bytearray()
@@ -109,6 +110,16 @@ class ToneChannel(Channel):
         self.last_state = self.ToneState()
         self.custom_instrument = [0, 0, 0, 0, 0, 0, 0, 0]
         self.custom_instrument_changed = False
+    
+    # When registers are written, we extract the data from them into self.state.
+    # We want to dump out the accumulated change only when we get to a wait.
+    # However we also want to accumulate that wait together with the change,
+    # in the case where the wait is small.
+    # Thus, we write to our internal data stream when we see a register write
+    # at a time after at least one frame of pauses has been seen; so we call
+    # maybe_write_data() before handling each update. This will emit (data)(pause)
+    # if pause is >0 frames, and do nothing (i.e. accumulate more data) if it
+    # is <1 frame.
 
     def reg1x(self, b):
         self.maybe_write_data()
