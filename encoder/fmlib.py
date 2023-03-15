@@ -18,6 +18,12 @@ class Command:
     def __str__(self):
         return f"Command({self.register:#04x}, {self.data:#04x})"
 
+class LoopPoint:
+    def __init__(self):
+        pass
+        
+    def __str__(self):
+        return "LoopPoint"
 
 class VgmFile:
     def __init__(self, filename):
@@ -52,6 +58,8 @@ class VgmFile:
 
     def commands(self):
         while self.position < self.eof_offset:
+            if self.position == self.loop_offset:
+                yield LoopPoint()
             b = self.data[self.position]
             self.position += 1
             if b == 0x4f:
@@ -148,6 +156,10 @@ class ToneChannel(Channel):
         if self.custom_instrument[index] != data:
             self.custom_instrument[index] = data
             self.custom_instrument_changed = True
+            
+    def add_loop(self):
+        self.write_data()
+        self.data.append(0b10000011)
         
     def write_data(self):
         # We want to encode some data for what's changed since last time, then the pause (if non-zero)
@@ -245,22 +257,28 @@ class RhythmChannel(Channel):
         
     def write(self, data):
         self.maybe_write_data()
-        self.value = data
+        self.value = data & 0b00011111
         self.value_changed = True
         
+    def add_loop(self):
+        self.write_data()
+        # A 1-length extended pause
+        self.data.append(0b10100000)
+        self.data.append(0b00000001)
+
     def write_data(self):
         frames = self.waits // 735
         
         if self.value_changed:
             if frames <= 4:
-                print(f"Rhythm: value changed to {self.value:b}, then wait {frames} frames")
+                print(f"Rhythm: value changed to {self.value:05b}, then wait {frames} frames")
                 b = 0
                 b |= (frames - 1) << 5
                 b |= self.value & 0b00011111
                 self.data.append(b)
                 frames = 0
             else:
-                print(f"Rhythm: value changed to {self.value:b}")
+                print(f"Rhythm: value changed to {self.value:05b}")
                 b = 0b10000000
                 b |= self.value & 0b00011111
                 self.data.append(b)
@@ -276,16 +294,16 @@ class RhythmChannel(Channel):
                     b |= frames
                     self.data.append(b)
                     frames = 0
-                elif frames <= 255 + 31: # 1 reserved length value
+                elif frames <= 255 + 30: # 1 reserved length value
                     # 2-byte count
                     self.data.append(b)
-                    self.data.append(frames - 31)
+                    self.data.append(frames - 30)
                     frames = 0
                 else:
                     # 2-byte max count and loop
                     self.data.append(b)
                     self.data.append(255)
-                    frames -= 255 + 31
+                    frames -= 255 + 30
 
     def terminate(self):
         # A zero-length extended pause
@@ -321,6 +339,7 @@ class RhythmChannel(Channel):
 #    %10000000 = key off, no change to anything else?
 #    %10000001 = end of stream
 #    %10000010 = custom instrument data, next 8 bytes to registers 0..7
+#    %10000011 = loop marker
 #    %100----- = reserved except for above
 # 4. Instrument or volume change
 #    %011txxxx = instrument (t=1) or volume (t=0) change to x
@@ -343,11 +362,17 @@ class RhythmChannel(Channel):
 #    %100kkkkk = write value k, rhythm enabled
 # 2. Waits
 #    %101nnnnn = pause n frames, max 31
-#    %10100000 xxxxxxxx = pause x+31 frames, x>0, max 286 <- note different to tone channels
+#    %10100000 xxxxxxxx = pause x+30 frames, x>0, max 285 <- note different to tone channels
 # 3. End of stream
 #    %10100000 00000000 = end of stream
+#    %10100000 00000001 = loop point
 # 4. Compression
-#    %11xxxxxx = compressed data, see below
+#    %11xxxxxx = compressed data
+#
+# Compressed data consists of:
+# %11xxxxxxx oooooooo oooooooo
+# This means that x+4 bytes (6-bit, max 259) from offset o (little-endian 16-bit)
+# should be consumed next. Such runs cannot "nest".
 
 # TODO support channel masking? Rhythm setup confuses this
 # TODO compression!
@@ -384,6 +409,10 @@ def convert(filename):
         if type(line) is Wait:
             for i in channels:
                 channels[i].wait(line.length)
+        elif type(line) is LoopPoint:
+            print("loop point")
+            for i in channels:
+                channels[i].add_loop()
         elif type(line) is Command:
             if line.register >= 0x10:
                 # tone register
@@ -404,7 +433,7 @@ def convert(filename):
                 channels[first_key_channel].add_custom(line.register, line.data)
             else:
                 # Something else
-                # TODO
+                print(f"Unhandled command for register {line.register}")
                 pass
                 
     # Terminate
@@ -416,6 +445,11 @@ def convert(filename):
     # Print some stuff
     for index in channels:
         print(f"ch{index} data = {len(channels[index].data)} bytes")
+        
+    # Dump data out, raw mess for now
+    with open(filename + ".fm", "wb") as f:
+        for index in channels:
+            f.write(channels[index].data)
 
     
 def main():
