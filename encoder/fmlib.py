@@ -376,8 +376,37 @@ class RhythmChannel(Channel):
 
 # TODO support channel masking? Rhythm setup confuses this
 # TODO compression!
-# TODO looping - needs to not be in a "compressed" run? How to keep track of it? Must also break up any pauses. Maybe I need a special command for this.
 # TODO allow dropping custom instrument data
+
+def longest_match(needle, haystack):
+    if len(haystack) < 4:
+        return 0, 0
+        
+    for l in range(min(len(needle), 259, len(haystack)), 3, -1):
+        offset = haystack.find(needle[:l])
+        if offset != -1:
+            return offset, l
+    return 0, 0
+
+def compress(data):
+    result = bytearray()
+    
+    position = 0
+    while position < len(data):
+        offset, length = longest_match(data[position:position+259], result)
+        print(f"position={position} match length {length}")
+        if length == 0:
+            result.append(data[position])
+            position += 1
+        else:
+            result.append(0b11000000 + length - 4)
+            result.append(position & 0xff)
+            result.append(position >> 8)
+            position += length
+            
+    print(f"Compressed {len(data)} to {len(result)}")
+    return result
+    
 
 def convert(filename):
     file = VgmFile(filename)
@@ -446,12 +475,20 @@ def convert(filename):
     for index in channels:
         print(f"ch{index} data = {len(channels[index].data)} bytes")
         
-    # Dump data out, raw mess for now
+    # Dump data out, raw mess for now - lacks pointers to channel data
     with open(filename + ".fm", "wb") as f:
         for index in channels:
             f.write(channels[index].data)
+            
+    # Compression time...
+    # We work through the data a byte at a time. 
+    # For each byte, we check if it is the start of a run matching what we have seen already. 
+    # This is not optimal - where we have repeating data, we'd prefer to encoded a longer raw run
+    # than to encode just a few bytes and refer to it may times.
+    for index in channels:
+        new_data = compress(channels[index].data)
 
-    
+
 def main():
     verb = sys.argv[1]
     if verb == 'convert':
