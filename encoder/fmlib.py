@@ -371,22 +371,24 @@ class RhythmChannel(Channel):
 #
 # Compressed data consists of:
 # %11xxxxxxx oooooooo oooooooo
-# This means that x+4 bytes (6-bit, max 259) from offset o (little-endian 16-bit)
+# This means that x+4 bytes (6-bit, max 67) from offset o (little-endian 16-bit)
 # should be consumed next. Such runs cannot "nest".
 
 # TODO support channel masking? Rhythm setup confuses this
-# TODO compression!
 # TODO allow dropping custom instrument data
 
+match_min = 16
+
 def longest_match(needle, haystack):
-    if len(haystack) < 4:
+    if len(haystack) < match_min or len(needle) < match_min:
         return 0, 0
         
-    for l in range(min(len(needle), 259, len(haystack)), 3, -1):
+    for l in range(min(len(needle), 63+4, len(haystack)), match_min, -1):
         offset = haystack.find(needle[:l])
         if offset != -1:
             return offset, l
     return 0, 0
+
 
 def compress(data):
     result = bytearray()
@@ -394,18 +396,32 @@ def compress(data):
     position = 0
     while position < len(data):
         offset, length = longest_match(data[position:position+259], result)
-        print(f"position={position} match length {length}")
         if length == 0:
             result.append(data[position])
             position += 1
         else:
+            print(f"position={position} match length {length}")
             result.append(0b11000000 + length - 4)
-            result.append(position & 0xff)
-            result.append(position >> 8)
+            result.extend(offset.to_bytes(2, byteorder='little'))
             position += length
             
     print(f"Compressed {len(data)} to {len(result)}")
     return result
+
+
+def save(data, filename):
+    # The end format is 18 bytes of pointers to per-channel data.
+    # The implicit offset of the first chunk is 0x0012.
+    # A zero pointer is used to indicate a channel is not used.
+    with open(filename, "wb") as f:
+        chunks = [compress(x) for x in data]
+        lengths = [len(x) for x in chunks]
+        offset = lengths[0]
+        for length in lengths[1:]:
+            f.write(offset.to_bytes(2, byteorder='little'))
+            offset += length
+        for chunk in chunks:
+            f.write(chunk)
     
 
 def convert(filename):
@@ -475,19 +491,15 @@ def convert(filename):
     for index in channels:
         print(f"ch{index} data = {len(channels[index].data)} bytes")
         
-    # Dump data out, raw mess for now - lacks pointers to channel data
-    with open(filename + ".fm", "wb") as f:
-        for index in channels:
-            f.write(channels[index].data)
+    # Save uncompressed
+    save([channels[index].data for index in channels], filename + ".fm")
             
     # Compression time...
     # We work through the data a byte at a time. 
     # For each byte, we check if it is the start of a run matching what we have seen already. 
     # This is not optimal - where we have repeating data, we'd prefer to encoded a longer raw run
     # than to encode just a few bytes and refer to it may times.
-    for index in channels:
-        new_data = compress(channels[index].data)
-
+    save([compress(channels[index].data) for index in channels], filename + ".compressed.fm")
 
 def main():
     verb = sys.argv[1]
