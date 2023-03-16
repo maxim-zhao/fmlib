@@ -2,7 +2,10 @@ import gzip;
 import copy;
 import sys;
 
+# We define some classes to represent the data in a VGM file
+
 class Wait:
+    """This represents a wait command"""
     def __init__(self, length):
         self.length = length;
 
@@ -11,6 +14,7 @@ class Wait:
 
 
 class Command:
+    """This represents a YM2413 command"""
     def __init__(self, register, data):
         self.register = register;
         self.data = data;
@@ -18,12 +22,14 @@ class Command:
     def __str__(self):
         return f"Command({self.register:#04x}, {self.data:#04x})"
 
+
 class LoopPoint:
-    def __init__(self):
-        pass
-        
+    """This represents the loop point"""
     def __str__(self):
         return "LoopPoint"
+
+
+# Next we make a class that parses a VGM file
 
 class VgmFile:
     def __init__(self, filename):
@@ -55,7 +61,7 @@ class VgmFile:
         value = self.read32(offset)
         return value + offset if value > 0 else 0
 
-
+    """This function yields the VGM commands as a stream"""
     def commands(self):
         while self.position < self.eof_offset:
             if self.position == self.loop_offset:
@@ -83,7 +89,12 @@ class VgmFile:
                 pass
             elif b == 0x66: # End
                 return
+        # TODO: handle other VGM commands (by skipping them)
 
+
+# Next we make classes which represent single channels in the YM2413.
+# These process the write commands into some internal state, and then manage writing 
+# that state to the FMLib binary format.
 
 class Channel:
     # This is a base for ToneChannel and RhythmChannel. It accumulates wait commands.
@@ -101,12 +112,14 @@ class Channel:
             return
         self.write_data()
 
+
 class ToneChannel(Channel):    
     class ToneState:
         def __init__(self):
             self.fnum = 0
             self.block = 0
             self.key = False
+            self.key_changed = False
             self.sustain = False
             self.volume = 0
             self.instrument = 0
@@ -141,7 +154,10 @@ class ToneChannel(Channel):
         # Block
         self.state.block = (b >> 1) & 0b111
         # Key
+        old_key = self.state.key
         self.state.key = b & 0b00010000 != 0
+        if self.state.key != old_key:
+            self.state.key_changed = True
         # Sustain
         self.state.sustain = b & 0b00100000 != 0
 
@@ -161,19 +177,33 @@ class ToneChannel(Channel):
         self.write_data()
         self.data.append(0b10000011)
         
+    def emit_key_up(self):
+        print(f"ch{self.channel}: Key up")
+        self.data.append(0b10000000)
+        
     def write_data(self):
         # We want to encode some data for what's changed since last time, then the pause (if non-zero)
         frames = self.waits // 735
         delta = self.state.fnum - self.last_state.fnum
 
         # If key has gone from down to up, we handle that first
+        need_key_up = False
         if (not self.state.key) and self.last_state.key:
-            print(f"ch{self.channel}: Key up")
-            self.data.append(0b10000000)
-            self.last_state.key = self.state.key
+            self.emit_key_up()
+            self.last_state.key = False
             # And we ignore any other changes... this is not quite VGM compatible as we are delaying those changes to the next key down
             delta = 0
         else:
+            # Check for multiple key changes. U-D-U would restart the note, D-U-D would give a short note.
+            if self.state.key_changed and self.state.key == self.last_state.key:
+                if self.state.key:
+                    # D-U-D: emit a key up
+                    print("D-U-D")
+                    self.emit_key_up()
+                else:
+                    # U-D-U: emit a key up later
+                    print("U-D-U")
+                    need_key_up = True
             # Check for a large f-num change or other change affecting block, key(, sustain)
             if delta < -4 or delta > 4 or self.state.block != self.last_state.block or self.state.sustain != self.last_state.sustain or self.state.key != self.last_state.key or frames == 0:
                 print(f"ch{self.channel}: Changed from key {self.last_state.key}, sustain {self.last_state.sustain}, block {self.last_state.block}, f-num {self.last_state.fnum} to key {self.state.key}, sustain {self.state.sustain}, block {self.state.block}, f-num {self.state.fnum}")
@@ -190,6 +220,10 @@ class ToneChannel(Channel):
                 self.last_state.block = self.state.block
                 self.last_state.fnum = self.state.fnum
                 # This captures 3 or 6 bytes of VGM to 2 bytes
+                
+                if need_key_up:
+                    self.emit_key_up()
+            self.state.key_changed = False;
             
             if self.state.volume != self.last_state.volume:
                 self.data.append(0b01100000 | self.state.volume)
@@ -353,6 +387,8 @@ class RhythmChannel(Channel):
 # %100xxxxx => special event
 #              x = 0 => key up
 #              x = 1 => end of stream
+#              x = 2 => custom instrument data, +8 bytes
+#              x = 3 => loop marker
 # %101sbbbf => start of key down, +1 extra byte for full note info
 # %11xxxxxx => compression run of length x+4, followed by two bytes offset of run start relative to start of all data
 #
@@ -391,11 +427,16 @@ def longest_match(needle, haystack):
 
 
 def compress(data):
+    # We work through the data a byte at a time. 
+    # For each byte, we check if it is the start of a run matching what we have seen already. 
+    # This is not optimal - where we have repeating data, we'd prefer to encoded a longer raw run
+    # than to encode just a few bytes and refer to it may times.
+    # We might also consider allowing cross-channel data references.
     result = bytearray()
     
     position = 0
     while position < len(data):
-        offset, length = longest_match(data[position:position+259], result)
+        offset, length = longest_match(data[position:position+63+4], result)
         if length == 0:
             result.append(data[position])
             position += 1
@@ -455,7 +496,6 @@ def convert(filename):
             for i in channels:
                 channels[i].wait(line.length)
         elif type(line) is LoopPoint:
-            print("loop point")
             for i in channels:
                 channels[i].add_loop()
         elif type(line) is Command:
@@ -463,6 +503,7 @@ def convert(filename):
                 # tone register
                 channel = line.register & 0xf
                 if channel > 8:
+                    print(f"Unhandled command for register {line.register}")
                     continue # shouldn't happen
                 if line.register & 0xf0 == 0x10:
                     channels[channel].reg1x(line.data)
@@ -479,7 +520,6 @@ def convert(filename):
             else:
                 # Something else
                 print(f"Unhandled command for register {line.register}")
-                pass
                 
     # Terminate
     for index in channels:
@@ -495,10 +535,6 @@ def convert(filename):
     save([channels[index].data for index in channels], filename + ".fm")
             
     # Compression time...
-    # We work through the data a byte at a time. 
-    # For each byte, we check if it is the start of a run matching what we have seen already. 
-    # This is not optimal - where we have repeating data, we'd prefer to encoded a longer raw run
-    # than to encode just a few bytes and refer to it may times.
     save([compress(channels[index].data) for index in channels], filename + ".compressed.fm")
 
 def main():
