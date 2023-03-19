@@ -451,14 +451,13 @@ def compress(data):
 
 
 def save(data, filename):
-    # The end format is 18 bytes of pointers to per-channel data.
-    # The implicit offset of the first chunk is 0x0012.
-    # A zero pointer is used to indicate a channel is not used.
+    # The end format is 20 bytes of pointers to per-channel data.
+    # A zero pointer will be used to indicate a channel is not used. TODO
     with open(filename, "wb") as f:
         chunks = [compress(x) for x in data]
         lengths = [len(x) for x in chunks]
         offset = lengths[0]
-        for length in lengths[1:]:
+        for length in lengths:
             f.write(offset.to_bytes(2, byteorder='little'))
             offset += length
         for chunk in chunks:
