@@ -6,10 +6,15 @@
   pauseLength dw ; Frame count for current pause
   savedDataOffset dw ; Backup while using a "compressed" run
   compressedDataLength db ; How many bytes to consume in the current "compressed" run
-  .union
-    registers dsb 3 ; $1x, $2x, $3x registers
-  .endu
+  registers dsb 3 ; $1x, $2x, $3x registers
 .endst
+
+.ifndef fmlib_memory_start
+.fail "fmlib_memory_start not defined"
+.endif
+
+.define FMLIB_PORT_REGISTER $f1
+.define FMLIB_PORT_DATA $f2
 
 .enum fmlib_memory_start
   fmlib_dataStart dw ; Could reuse? only needed in start
@@ -41,7 +46,6 @@ _fmlib_getByte:
   ld a,(hl)
   ; Check for start of compression
   and %11000000
-  push af
   cp %11000000
   jr z,_compressed
 _readRawByte:
@@ -123,7 +127,7 @@ fmlib_start:
   
 fmlib_play:
   ; Uses: af, bc, de, hl, ix
-  ld b,9
+  ld b,10
   ld ix,fmlib_channels
 -:
   ; Read channel pointer
@@ -139,7 +143,7 @@ fmlib_play:
   ld d,(ix+fmlib_channel.pauseLength+1)
   ld a,d
   or e
-  jr nz,+
+  jr z,+
   
   ; We are in a pause
   dec de
@@ -151,14 +155,21 @@ fmlib_play:
   call _fmlib_readData
 
 _done:
+  ; Move to next channel
+  push ix
+  pop hl
+  ld de,_sizeof_fmlib_channel
+  add hl,de
+  push hl
+  pop ix
   djnz -
 
   ret
   
 _fmlib_readData:
   ; Check if noise
-  ld a,9
-  sub b
+  ld a,b
+  cp 1 ; TODO this?
   jp z,_fmlib_readData_noise
   ; It's a tone channel
 _fmlib_readData_tone:
@@ -190,24 +201,24 @@ _fmlib_readData_tone:
 +:; Move to de and extend to 16 bits
   ld e,a
   ; Then add to the registers as a word
-  ld l,(ix+fmlib_channel.registers.0)
-  ld h,(ix+fmlib_channel.registers.1)
+  ld l,(ix+fmlib_channel.registers+0)
+  ld h,(ix+fmlib_channel.registers+1)
   add hl,de
-  ld (ix+fmlib_channel.fNum.0),l
-  ld (ix+fmlib_channel.fNum.1),h
+  ld (ix+fmlib_channel.registers+0),l
+  ld (ix+fmlib_channel.registers+1),h
   ; And emit it. We emit both bytes (for now)
   ld a,b
   and $20
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_REGISTER),a
   ; TODO: waits
   ld a,h
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_DATA),a
   ld a,b
   and $10
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_REGISTER),a
   ; TODO: waits
   ld a,l
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_DATA),a
   ; And done
   inc hl
   ret
@@ -257,16 +268,16 @@ _not010:
     ; Emit first write while a is free
     ld a,b
     and $30
-    out (FMLIB_PORT),a
+    out (FMLIB_PORT_REGISTER),a
     ; Capture low nibble in c
-    ld a,(ix+fmlib_channel.instvol)
+    ld a,(ix+fmlib_channel.registers+2)
     and $0f
 -:  ld c,a
   pop af
   and c
-  ld (ix+fmlib_channel.instvol),a
-  out (FMLIB_PORT),a
-  jr _fmlib_readData_tone
+  ld (ix+fmlib_channel.registers+2),a
+  out (FMLIB_PORT_DATA),a
+  jp _fmlib_readData_tone
   
 +:; volume, merge with instrument nibble
   and $0f
@@ -275,9 +286,9 @@ _not010:
     ; Emit first write while a is free
     ld a,b
     and $30
-    out (FMLIB_PORT),a
+    out (FMLIB_PORT_REGISTER),a
     ; Capture high nibble in c
-    ld a,(ix+fmlib_channel.registers.3)
+    ld a,(ix+fmlib_channel.registers+2)
     and $f0
     jr - ; code is the same from here
   
@@ -292,17 +303,17 @@ _not011:
   jr nz,+
   ; 0 => key up
   ; Clear the bit
-  ld a,(ix+fmlib_channel.registers)
+  ld a,(ix+fmlib_channel.registers+1)
   and %11101111
-  ld a,(ix+fmlib_channel.registers)
+  ld a,(ix+fmlib_channel.registers+1)
   ; Emit it
   push af
     ld a,b
     and $20
-    out (FMLIB_PORT),a
+    out (FMLIB_PORT_REGISTER),a
   pop af
-  out (FMLIB_PORT),a
-  jr _fmlib_readData_tone
+  out (FMLIB_PORT_DATA),a
+  jp _fmlib_readData_tone
   
 +:dec a
   jp z,_endOfStream
@@ -313,9 +324,9 @@ _not011:
   ; 2 => custom instrument data
   ld d,0
 -:ld a,d
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_REGISTER),a
   call _fmlib_getByte
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_DATA),a
   inc d
   ; If it gets to 8, we are done
   ld a,d
@@ -334,15 +345,15 @@ _not100:
   ; this is %101sbbbf ffffffff = full note + key down
   ld a,$20
   or b
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_REGISTER),a
   ld a,(hl) ; The byte can be used as-is as the top two bits are ignored
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_DATA),a
   ; Then the next byte goes to $1x
   ld a,$10
   or b ; Is it cheaper to ld a,b; set 4,a? TODO
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_REGISTER),a
   call _fmlib_getByte
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_DATA),a
   ; And done
   jp _fmlib_readData_tone
   
@@ -354,13 +365,13 @@ _fmlib_readData_noise:
   jr nz,_not0x
   ; %0nnkkkkk keys + wait
   ld a,$0e
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_REGISTER),a
   ld a,(hl)
   ; Enable rhythm mode
   and %00011111
   or  %00100000
   ; Emit
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_DATA),a
   ; Get pause
   sla a
   sla a
@@ -376,18 +387,20 @@ _savePauseLength:
 
 _not0x:
   and %01100000
-  jr nz,_not100
+  jr nz,_not100r
   ; %100kkkkk
+  ld a,$0e
+  out (FMLIB_PORT_REGISTER),a
   ld a,(hl)
   ; Enable rhythm mode
   and %00011111
   or  %00100000
   ; Emit
-  out (FMLIB_PORT),a
+  out (FMLIB_PORT_DATA),a
   ; Move to next byte
   jp _fmlib_readData_noise
   
-_not100:
+_not100r:
   ; Must be %101xxxxx
   ld a,(hl)
   and %00011111

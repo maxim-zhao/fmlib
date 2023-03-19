@@ -413,7 +413,7 @@ class RhythmChannel(Channel):
 # TODO support channel masking? Rhythm setup confuses this
 # TODO allow dropping custom instrument data
 
-match_min = 16
+match_min = 4
 
 def longest_match(needle, haystack):
     if len(haystack) < match_min or len(needle) < match_min:
