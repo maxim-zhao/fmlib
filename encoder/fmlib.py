@@ -119,10 +119,12 @@ class ToneChannel(Channel):
             self.fnum = 0
             self.block = 0
             self.key = False
-            self.key_changed = False
+            self.key_change_count = 0
             self.sustain = False
             self.volume = 0
             self.instrument = 0
+        def __str__(self):
+            return f"fnum={self.fnum} bl={self.block} i={self.instrument} v={self.volume} key={self.key}({self.key_change_count}) sus={self.sustain}"
 
     def __init__(self, index):
         super().__init__()
@@ -146,6 +148,7 @@ class ToneChannel(Channel):
         self.maybe_write_data()
         # F-Num low bits
         self.state.fnum = (self.state.fnum & 0x100) | b
+        print(self.state)
 
     def reg2x(self, b):
         self.maybe_write_data()
@@ -157,9 +160,10 @@ class ToneChannel(Channel):
         old_key = self.state.key
         self.state.key = b & 0b00010000 != 0
         if self.state.key != old_key:
-            self.state.key_changed = True
+            self.state.key_change_count += 1
         # Sustain
         self.state.sustain = b & 0b00100000 != 0
+        print(self.state)
 
     def reg3x(self, b):
         self.maybe_write_data()
@@ -167,7 +171,8 @@ class ToneChannel(Channel):
         self.state.volume = b & 0b1111
         # Instrument
         self.state.instrument = b >> 4
-
+        print(self.state)
+        
     def add_custom(self, index, data):
         if self.custom_instrument[index] != data:
             self.custom_instrument[index] = data
@@ -191,11 +196,12 @@ class ToneChannel(Channel):
         if (not self.state.key) and self.last_state.key:
             self.emit_key_up()
             self.last_state.key = False
+            self.state.key_change_count = 0;
             # And we ignore any other changes... this is not quite VGM compatible as we are delaying those changes to the next key down
             delta = 0
         else:
             # Check for multiple key changes. U-D-U would restart the note, D-U-D would give a short note.
-            if self.state.key_changed and self.state.key == self.last_state.key:
+            if self.state.key_change_count > 1:
                 if self.state.key:
                     # D-U-D: emit a key up
                     print("D-U-D")
@@ -215,6 +221,7 @@ class ToneChannel(Channel):
                 self.data.append(b)
                 self.data.append(self.state.fnum & 0xff)
                 # Remember the changes
+                delta = 0
                 self.last_state.key = self.state.key
                 self.last_state.sustain = self.state.sustain
                 self.last_state.block = self.state.block
@@ -223,7 +230,7 @@ class ToneChannel(Channel):
                 
                 if need_key_up:
                     self.emit_key_up()
-            self.state.key_changed = False;
+            self.state.key_change_count = 0;
             
             if self.state.volume != self.last_state.volume:
                 self.data.append(0b01100000 | self.state.volume)
@@ -235,7 +242,7 @@ class ToneChannel(Channel):
                 print(f"ch{self.channel}: instrument changed to {self.state.instrument}")
             # These two will expand 3 bytes to 1 or 2 bytes of data
             
-        if self.state.fnum != self.last_state.fnum:
+        if delta != 0:
             # Must be a small change left over from above, not accompanied by anything else important
             print(f"ch{self.channel}: Changed f-num from {self.last_state.fnum} to {self.state.fnum} ({delta}) and wait is {frames} frames")
             b = 0
@@ -371,6 +378,7 @@ class RhythmChannel(Channel):
 # 3. Note changes or key change
 #    %101sbbbf ffffffff = block b, F-num f, implicit key on, sustain s
 #    %10000000 = key off, no change to anything else?
+# TODO use spare bits here for pauses, we often see key up/pause 1 for example
 #    %10000001 = end of stream
 #    %10000010 = custom instrument data, next 8 bytes to registers 0..7
 #    %10000011 = loop marker
@@ -410,7 +418,7 @@ class RhythmChannel(Channel):
 # This means that x+4 bytes (6-bit, max 67) from offset o (little-endian 16-bit)
 # should be consumed next. Such runs cannot "nest".
 
-# TODO support channel masking? Rhythm setup confuses this
+# TODO support channel masking
 # TODO allow dropping custom instrument data
 
 match_min = 4
@@ -456,7 +464,7 @@ def save(data, filename):
     with open(filename, "wb") as f:
         chunks = [compress(x) for x in data]
         lengths = [len(x) for x in chunks]
-        offset = lengths[0]
+        offset = len(data)*2
         for length in lengths:
             f.write(offset.to_bytes(2, byteorder='little'))
             offset += length

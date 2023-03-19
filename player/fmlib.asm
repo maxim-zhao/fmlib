@@ -9,14 +9,19 @@
   registers dsb 3 ; $1x, $2x, $3x registers
 .endst
 
-.ifndef fmlib_memory_start
-.fail "fmlib_memory_start not defined"
+.ifndef FMLIB_MEMORY_START
+.fail "FMLIB_MEMORY_START not defined"
 .endif
 
-.define FMLIB_PORT_REGISTER $f1
-.define FMLIB_PORT_DATA $f2
+.define FMLIB_PORT_REGISTER $f0
+.define FMLIB_PORT_DATA $f1
+.define FMLIB_PORT_AUDIO_CONTROL $f2
+.ifndef FMLIB_MEMORY_CONTROL_ADDRESS
+.define FMLIB_MEMORY_CONTROL_ADDRESS $c000 ; default
+.endif
+.define FMLIB_PORT_MEMORY_CONTROL $3e
 
-.enum fmlib_memory_start
+.enum FMLIB_MEMORY_START
   fmlib_dataStart dw ; Could reuse? only needed in start
   fmlib_channels instanceof fmlib_channel 10 ; 0-8 tone channels, plus rhythm
 .ende
@@ -25,18 +30,18 @@ _fmlib_getByte:
   ; Returns next byte in a. Leaves HL pointing at it.
   ; If the next byte is a compression run, deals with it.
 
-  ; Check for end of compression
-  ld a,(ix+fmlib_channel.compressedDataLength)
-  or a
-  jr z,+
-  ; Non-zero -> decrement
-  dec a
-  ld (ix+fmlib_channel.compressedDataLength),a
-  ; If it reaches zero, we want to restore the old pointer
-  jr nz,+
-  ld l,(ix+fmlib_channel.savedDataOffset+0)
-  ld h,(ix+fmlib_channel.savedDataOffset+1)
-  jr ++
+;  ; Check for end of compression
+;  ld a,(ix+fmlib_channel.compressedDataLength)
+;  or a
+;  jr z,+
+;  ; Non-zero -> decrement
+;  dec a
+;  ld (ix+fmlib_channel.compressedDataLength),a
+;  ; If it reaches zero, we want to restore the old pointer
+;  jr nz,+
+;  ld l,(ix+fmlib_channel.savedDataOffset+0)
+;  ld h,(ix+fmlib_channel.savedDataOffset+1)
+;  jr ++
 +:
   ; Read pointer
   ld l,(ix+fmlib_channel.dataOffset+0)
@@ -44,10 +49,10 @@ _fmlib_getByte:
 ++:
   ; Get byte
   ld a,(hl)
-  ; Check for start of compression
-  and %11000000
-  cp %11000000
-  jr z,_compressed
+;  ; Check for start of compression
+;  and %11000000
+;  cp %11000000
+;  jr z,_compressed
 _readRawByte:
   ; Read byte
   ld a,(hl)
@@ -123,11 +128,18 @@ fmlib_start:
   ; loop
   djnz -
   
+  ; Enable FM
+  ld a,%00000011
+  out (FMLIB_PORT_AUDIO_CONTROL),a
+  
   ret
   
 fmlib_play:
+  ld a,(FMLIB_MEMORY_CONTROL_ADDRESS)
+  or %00000100 ; disable I/O chip so we can access YM2413
+  out (FMLIB_PORT_MEMORY_CONTROL),a
   ; Uses: af, bc, de, hl, ix
-  ld b,10
+  ld b,0 ; First tone channel
   ld ix,fmlib_channels
 -:
   ; Read channel pointer
@@ -152,7 +164,7 @@ fmlib_play:
   jr _done
   
 +:; Load some data
-  call _fmlib_readData
+  call _fmlib_readData_tone
 
 _done:
   ; Move to next channel
@@ -162,16 +174,18 @@ _done:
   add hl,de
   push hl
   pop ix
-  djnz -
-
+  inc b
+  ld a,b
+  cp 1 ; 9
+  jr nz,-
+  ;call _fmlib_readData_noise
+ 
+  ; Re-enable I/O chip
+  ld a,(FMLIB_MEMORY_CONTROL_ADDRESS)
+  out (FMLIB_PORT_MEMORY_CONTROL),a
+  ; Return from fmlib_play
   ret
   
-_fmlib_readData:
-  ; Check if noise
-  ld a,b
-  cp 1 ; TODO this?
-  jp z,_fmlib_readData_noise
-  ; It's a tone channel
 _fmlib_readData_tone:
   call _fmlib_getByte
   and %11000000
@@ -208,17 +222,20 @@ _fmlib_readData_tone:
   ld (ix+fmlib_channel.registers+1),h
   ; And emit it. We emit both bytes (for now)
   ld a,b
-  and $20
+  or $20
   out (FMLIB_PORT_REGISTER),a
-  ; TODO: waits
+  ; YM2413AM says it needs 12 cycles after setting address, 84 cycles after setting data.
+  ; out (nn),a is 10 cycles, so we only need 2 more here.
   ld a,h
   out (FMLIB_PORT_DATA),a
-  ld a,b
-  and $10
+  ; But we need 74 here! We should try to move work into this wait. TODO
+  ld a,b ; 4
+  or $10 ; 7
+  call _delay63
   out (FMLIB_PORT_REGISTER),a
-  ; TODO: waits
   ld a,l
   out (FMLIB_PORT_DATA),a
+  ; Assume next will be long enough later?
   ; And done
   inc hl
   ret
@@ -262,19 +279,21 @@ _not010:
   jr nz,+
   ; instrument, merge with volume nibble
   ; Shift to high nibble
-  rld ; TODO check this
+  .repeat 4
+    add a,a
+  .endr
   and $f0
   push af
     ; Emit first write while a is free
     ld a,b
-    and $30
+    or $30
     out (FMLIB_PORT_REGISTER),a
     ; Capture low nibble in c
     ld a,(ix+fmlib_channel.registers+2)
     and $0f
 -:  ld c,a
   pop af
-  and c
+  or c
   ld (ix+fmlib_channel.registers+2),a
   out (FMLIB_PORT_DATA),a
   jp _fmlib_readData_tone
@@ -282,10 +301,9 @@ _not010:
 +:; volume, merge with instrument nibble
   and $0f
   push af
-  pop af
     ; Emit first write while a is free
     ld a,b
-    and $30
+    or $30
     out (FMLIB_PORT_REGISTER),a
     ; Capture high nibble in c
     ld a,(ix+fmlib_channel.registers+2)
@@ -309,7 +327,7 @@ _not011:
   ; Emit it
   push af
     ld a,b
-    and $20
+    or $20
     out (FMLIB_PORT_REGISTER),a
   pop af
   out (FMLIB_PORT_DATA),a
@@ -348,11 +366,13 @@ _not100:
   out (FMLIB_PORT_REGISTER),a
   ld a,(hl) ; The byte can be used as-is as the top two bits are ignored
   out (FMLIB_PORT_DATA),a
+  ld (ix+fmlib_channel.registers+1),a
   ; Then the next byte goes to $1x
   ld a,$10
   or b ; Is it cheaper to ld a,b; set 4,a? TODO
   out (FMLIB_PORT_REGISTER),a
   call _fmlib_getByte
+  ld (ix+fmlib_channel.registers+0),a
   out (FMLIB_PORT_DATA),a
   ; And done
   jp _fmlib_readData_tone
@@ -424,3 +444,10 @@ _endOfStream:
   ; And done
   ret
 
+_delay63:
+  ; call and ret cost 27, we need to waste 36
+  .repeat 9
+  nop
+  .endr
+  ret
+  

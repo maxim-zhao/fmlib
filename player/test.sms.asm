@@ -221,6 +221,6 @@ Data:
 .ends
 
 .section "fmlib" free
-.define fmlib_memory_start $c010
+.define FMLIB_MEMORY_START $c010
 .include "fmlib.asm"
 .ends
