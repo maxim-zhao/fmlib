@@ -276,7 +276,7 @@ _not010:
   ; check type
   ld a,(hl)
   bit 4,a
-  jr nz,+
+  jr z,+
   ; instrument, merge with volume nibble
   ; Shift to high nibble
   .repeat 4
@@ -364,7 +364,17 @@ _not100:
   ld a,$20
   or b
   out (FMLIB_PORT_REGISTER),a
-  ld a,(hl) ; The byte can be used as-is as the top two bits are ignored
+  ; We need to move the sustain bit one to the left...
+  ld a,(hl)
+  and %00010000
+  add a,a
+  ; then mix it back in
+  ld c,a
+  ld a,(hl)
+  and %00001111
+  or c
+  ; and set the key bit
+  or %00010000
   out (FMLIB_PORT_DATA),a
   ld (ix+fmlib_channel.registers+1),a
   ; Then the next byte goes to $1x

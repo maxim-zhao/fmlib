@@ -65,7 +65,9 @@ VDPRegLineInt            db
 InterruptHandler:
   ex af,af'
   exx
-    call fmlib_play
+    in a,($bf)
+    and %10000000
+    call nz, fmlib_play
   exx
   ex af,af'
   ei
@@ -218,6 +220,17 @@ ClearVRAM:
 .section "Data" superfree
 Data:
 .incbin "data.vgm.fm"
+/*
+.dw _ch0-Data, 0, 0, 0, 0, 0, 0, 0, 0, 0
+_ch0:
+.db %01100000 ; volume to 0 => max
+.db %01110111 ; instrument 7
+.db %10101001 %00000001 ; a tone with key down
+.repeat 100
+.db %01000000 %11111111 ; a long wait
+.endr
+.db %10000001 ; end of stream
+*/
 .ends
 
 .section "fmlib" free
