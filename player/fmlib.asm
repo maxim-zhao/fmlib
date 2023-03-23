@@ -176,7 +176,7 @@ _done:
   pop ix
   inc b
   ld a,b
-  cp 1 ; 9
+  cp 1;9
   jr nz,-
   ;call _fmlib_readData_noise
  
