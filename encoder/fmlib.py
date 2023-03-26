@@ -564,13 +564,16 @@ def compress2(chunks, min_length):
             if time.time() > next_print_time:
                 print(f"{position}/{max_position}, best: {best_savings}", end="\r")
                 next_print_time += 0.1
+            if position-1 in pointers or position in pointers or position+1 in pointers:
+                # not a valid source
+                continue
             # For each possible run length...
             for length in range(min_length, min(max_length, len(data) - position) + 1):
                 # Extract the slice of data
                 run = data[position:position + length]
                 # Find matches after the run itself
                 # print(f"Looking for matches of length {length} at offset {position}")
-                matches = [x for x in find_matches(run, data, position + length, pointers, runs)]
+                matches = [x for x in find_matches(run, data, pointers, runs) if x != position]
                 # If none, then don't try longer lengths
                 if len(matches) == 0:
                     break
@@ -635,9 +638,9 @@ def splice(data, offset, pointer, length):
     data[offset:offset + length] = replacement
 
 
-def find_matches(needle, haystack, start, pointers, runs):
-    # Yields offsets of needle in haystack[start:], where there's no overlap to pointers and existing run sources
-    offset = start
+def find_matches(needle, haystack, pointers, runs):
+    # Yields offsets of needle in haystack, where there's no overlap to pointers and existing run sources
+    offset = 0
     while True:
         offset = haystack.find(needle, offset)
         if offset == -1:
@@ -920,8 +923,8 @@ def convert2(filename):
             f.write(compressed)
 
 
-def testcompress2(count):
-    data = "AAAAAAAABBBBBBBBBBAAAAAAAACCCCCCCC".encode(encoding='ascii')
+def testcompress2():
+    data = "ABCDEFGHxABCDEFGHIJyABCDEFGHIJzABCDEFGHIJaABCDEFGHIJbABCDEFGHIJ".encode(encoding='ascii')
     compressed = compress2([data], 4)
     with open("testcompressed.bin", "wb") as f:
         f.write(compressed)
@@ -934,7 +937,7 @@ def main():
     elif verb == 'convert2':
         convert2(sys.argv[2])
     elif verb == 'testcompress2':
-        testcompress2(int(sys.argv[2]))
+        testcompress2()
     else:
         raise Exception(f"Unknown verb \"{verb}\"")
 
