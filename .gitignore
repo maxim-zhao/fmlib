@@ -7,3 +7,5 @@
 *.sms
 *.sym
 *.fm2
+/encoder/.idea/
+*.bin
