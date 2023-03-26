@@ -557,8 +557,8 @@ def compress2(chunks, min_length):
     next_print_time = time.time() + 0.1
     while True:
         best_savings = 0
-        # position = 0
         max_position = len(data) - min_length
+        tried_needles = set()
         # For each position in the data...
         for position in range(0, max_position):
             if time.time() > next_print_time:
@@ -571,6 +571,11 @@ def compress2(chunks, min_length):
             for length in range(min_length, min(max_length, len(data) - position) + 1):
                 # Extract the slice of data
                 run = data[position:position + length]
+                # Skip if already done
+                s = str(run)
+                if s in tried_needles:
+                    continue
+                tried_needles.add(s)
                 # Find matches after the run itself
                 # print(f"Looking for matches of length {length} at offset {position}")
                 matches = [x for x in find_matches(run, data, pointers, runs) if x != position]
@@ -924,7 +929,7 @@ def convert2(filename):
 
 
 def testcompress2():
-    data = "ABCDEFGHxABCDEFGHIJyABCDEFGHIJzABCDEFGHIJaABCDEFGHIJbABCDEFGHIJ".encode(encoding='ascii')
+    data = "ABCDxABCDEFGHIJyABCDEFGHIJzABCDEFGHIJaABCDEFGHIJbABCDEFGHIJ".encode(encoding='ascii')
     compressed = compress2([data], 4)
     with open("testcompressed.bin", "wb") as f:
         f.write(compressed)
