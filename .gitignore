@@ -9,3 +9,5 @@
 *.fm2
 /encoder/.idea/
 *.bin
+*.pyc
+*.fmlib

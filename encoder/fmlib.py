@@ -1,42 +1,34 @@
 import gzip
 import sys
 import time
+import unittest
+from dataclasses import dataclass
 
 
 # We define some classes to represent the data in a VGM file
 
+@dataclass
 class Wait:
     """This represents a wait command"""
-
-    def __init__(self, length):
-        self.length = length
-
-    def __str__(self):
-        return f"Wait({self.length})"
+    length: int
 
 
-class Command:
+@dataclass
+class Ym2413Command:
     """This represents a YM2413 command"""
-
-    def __init__(self, register, data):
-        self.register = register
-        self.data = data
-
-    def __str__(self):
-        return f"Command({self.register:#04x}, {self.data:#04x})"
+    register: int
+    data: int
 
 
+@dataclass
 class LoopPoint:
     """This represents the loop point"""
-
-    def __str__(self):
-        return "LoopPoint"
 
 
 # Next we make a class that parses a VGM file
 
 class VgmFile:
-    def __init__(self, filename):
+    def __init__(self, filename: str):
         with gzip.open(filename, "rb") as f:
             self.data = f.read()
 
@@ -56,10 +48,10 @@ class VgmFile:
 
         self.position = self.data_offset
 
-    def read32(self, offset):
+    def read32(self, offset: int):
         return int.from_bytes(self.data[offset:offset + 4], byteorder='little')
 
-    def read32_relative(self, offset):
+    def read32_relative(self, offset: int):
         value = self.read32(offset)
         return value + offset if value > 0 else 0
 
@@ -77,7 +69,7 @@ class VgmFile:
                 self.position += 1
                 pass  # PSG
             elif b == 0x51:  # YM2413
-                yield Command(self.data[self.position], self.data[self.position + 1])
+                yield Ym2413Command(self.data[self.position], self.data[self.position + 1])
                 self.position += 2
                 pass
             elif b == 0x61:  # Wait nnnn
@@ -100,7 +92,8 @@ class VgmFile:
 # that state to the FMLib binary format.
 
 class Channel:
-    # This is a base for ToneChannel and RhythmChannel. It accumulates wait commands.
+    """This is a base for ToneChannel and RhythmChannel. It accumulates wait commands."""
+
     def __init__(self):
         self.waits = 0
         self.data = bytearray()
@@ -120,27 +113,94 @@ class Channel:
         pass
 
 
-class ToneChannel(Channel):
+class ChannelBase:
+    """A channel with some data"""
+
+    def __init__(self, index: int):
+        self.data = bytearray()
+        self.index = index
+        self.wait_samples = 0
+
+    def add_loop(self):
+        self.emit_wait()
+        self.data.append(0b10100001)
+
+    def wait(self, length: int):
+        # We get waits in "samples" (1/44100 s).
+        # We want to convert them to frames.
+        # We do that by accumulating and writing them later.
+        self.wait_samples += length
+
+    def emit_wait(self):
+        while self.wait_samples > 735:
+            frames = min(self.wait_samples // 735, 32)
+            self.data.append((0b100 << 5) | (frames - 1))
+            self.wait_samples -= frames * 735
+
+    def end(self):
+        self.emit_wait()
+        self.data.append(0b10100000)
+
+    def __str__(self):
+        return f"ch{self.index}[{len(self.data)}]"
+
+    def append_if_changed(self, prefix: int, mask: int, old_value: int, new_value: int, shift: int):
+        new_value >>= shift
+        new_value &= mask
+        if old_value != -1:
+            old_value >>= shift
+            old_value &= mask
+            if old_value == new_value:
+                return
+        self.data.append(prefix | new_value)
+
+
+class ToneChannel(ChannelBase):
+    def __init__(self, index: int):
+        super().__init__(index)
+        self.reg1 = -1
+        self.reg2 = -1
+        self.reg3 = -1
+
+    def reg1x(self, b: int):
+        self.emit_wait()
+        # Only emit changes
+        self.append_if_changed(0b00000000, 0b1111, self.reg1, b, 0)
+        self.append_if_changed(0b00010000, 0b1111, self.reg1, b, 4)
+        self.reg1 = b
+
+    def reg2x(self, b: int):
+        self.emit_wait()
+        self.append_if_changed(0b01000000, 0b111111, self.reg2, b, 0)
+        self.reg2 = b
+
+    def reg3x(self, b: int):
+        self.emit_wait()
+        self.append_if_changed(0b00100000, 0b1111, self.reg3, b, 0)
+        self.append_if_changed(0b00110000, 0b1111, self.reg3, b, 4)
+        self.reg3 = b
+
+class RhythmChannel(ChannelBase):
+    def __init__(self, index: int):
+        super().__init__(index)
+        self.value = -1
+
+    def write(self, b: int):
+        self.emit_wait()
+        self.append_if_changed(0b00000000, 0b111111, self.value, b, 0)
+        self.value = b
+
+
+class OldToneChannel(Channel):
+    @dataclass
     class ToneState:
-        instrument: int
-        volume: int
-        key: bool
-        block: int
-        fnum: int
-        sustain: bool
-        key_change_count: int
-
-        def __init__(self):
-            self.fnum = 0
-            self.block = 0
-            self.key = False
-            self.key_change_count = 0
-            self.sustain = False
-            self.volume = 0
-            self.instrument = 0
-
-        def __str__(self):
-            return f"fnum={self.fnum} bl={self.block} i={self.instrument} v={self.volume} key={self.key}({self.key_change_count}) sus={self.sustain}"
+        instrument: int = 0
+        volume: int = 0
+        key: bool = False
+        block: int = 0
+        fnum: int = 0
+        sustain: bool = False
+        key_change_count: int = 0
 
     def __init__(self, index):
         super().__init__()
@@ -152,7 +212,7 @@ class ToneChannel(Channel):
 
     # When registers are written, we extract the data from them into self.state.
     # We want to dump out the accumulated change only when we get to a wait.
-    # However we also want to accumulate that wait together with the change,
+    # However, we also want to accumulate that wait together with the change,
     # in the case where the wait is small.
     # Thus, we write to our internal data stream when we see a register write
     # at a time after at least one frame of pauses has been seen; so we call
@@ -309,7 +369,7 @@ class ToneChannel(Channel):
         self.data.append(0b10000001)
 
 
-class RhythmChannel(Channel):
+class OldRhythmChannel(Channel):
     def __init__(self):
         super().__init__()
         self.value = 0
@@ -373,15 +433,34 @@ class RhythmChannel(Channel):
 
 # FMLib format speculation:
 #
-# Each tone channel has its own sequence of pauses, frequency changes and key events.
-# We also want to have a rhythm channel and another channel, for data not captured here?
-# Is this better or worse than encoding it all in one stream?
-# YM2413 registers cover:
+# Each tone channel is managed as a separate stream, with an implicit channel number.
+# We also have a stream that holds rhythm and custom instrument writes.
+# We translate the YM2413 register writes as follows:
+# Tone channels:
+# Register 1x: F-num low bits (8)
+# Register 2x: F-num high bit (1); block (2); key (1); sustain (1)
+# Register 3x: volume (4); instrument (4)
+# Encoding:
+# %0000xxxx: 1x low nibble (if changed)
+# %0001xxxx: 1x high nibble (if changed)
+# %01xxxxxx: 2x all bits
+# %0010xxxx: 3x instrument (if changed)
+# %0011xxxx: 3x volume (if changed)
+# %100xxxxx: wait x+1 frames
+# %101xxxxx: compression: x+3 bytes length, followed by offset (2 bytes)
+# %10100000: end of data
+# %10100001: loop point
+# %11sxxyyy: small f-num change + wait:
+#   s = sign 
+#   xx = abs(change) - 1
+#   yyy = wait duration in frames
+
+# YM2413 tone registers cover:
 # 1x: F-Num low bits (8)
 # 2x: F-Num high bit (1); block (2); key (1); sustain (1)
 # 3x: volume (4); instrument (4)
 # * The note frequency is determined by F-Num * 2^block. This is likely to change very often.
-#   It may be altered by vibrato, which leads to a lot of small changes (typically +/- 1 F-Num).
+#   It may be altered by vibrato, which leads to a lot of small changes (typically +/- 1-4 F-Num).
 #   Block changes are less frequent.
 #   If we represent the note frequency as F-Num * 2^block then it is a 14-bit number.
 # * Key changes are of course the start and end of every note.
@@ -390,66 +469,11 @@ class RhythmChannel(Channel):
 # * Volume and instrument changes are rare
 # * Custom instrument may not be used at all, or if it is it's unlikely to change much
 # We therefore try to optimise for data as so:
-# 1. Small frequency changes with small waits
-#    %00sxxyyy = change F-num by x+1, s = sign (1 -> -x, 0 -> +x) and wait y+1 frames (max 8)
-# 2. Waits
-#    %010xxxxx = wait x frames, max 31
-#    %01000000 xxxxxxxx = wait x+32 frames, max 287
-# 3. Note changes or key change
-#    %101sbbbf ffffffff = block b, F-num f, implicit key on, sustain s
-#    %10000000 = key off, no change to anything else?
-# TODO use spare bits here for pauses, we often see key up/pause 1 for example
-# TODO we need to capture changes during key up, e.g. freq -> 0
-# TODO we need to ensure key events are in order! Instrument change before of after key press will matter a lot
-#    %10000001 = end of stream
-#    %10000010 = custom instrument data, next 8 bytes to registers 0..7
-#    %10000011 = loop marker
-#    %100----- = reserved except for above
-# 4. Instrument or volume change
-#    %011txxxx = instrument (t=1) or volume (t=0) change to x
-# 5. Compression
-#    %11xxxxxx = compressed data, see below
-#
-# Or, in bit order:
-# %00sxxyyy => F-num delta plus wait
-# %010xxxxx => wait, may have an extra byte if x=0
-# %011txxxx => instrument (t=0) or volume (t=1) change
-# %100xxxxx => special event
-#              x = 0 => key up
-#              x = 1 => end of stream
-#              x = 2 => custom instrument data, +8 bytes
-#              x = 3 => loop marker
-# %101sbbbf => start of key down, +1 extra byte for full note info
-# %11xxxxxx => compression run of length x+4, followed by two bytes offset of run start relative to start of all data
-#
-# For rhythm data:
-# 1. Rhythm keys down
-#    %0nnkkkkk = write value k, rhythm enabled, pause n+1 frames (max 4)
-#    %100kkkkk = write value k, rhythm enabled
-# 2. Waits
-#    %101nnnnn = pause n frames, max 31
-#    %10100000 xxxxxxxx = pause x+30 frames, x>0, max 285 <- note different to tone channels
-# 3. End of stream
-#    %10100000 00000000 = end of stream
-#    %10100000 00000001 = loop point
-# 4. Compression
-#    %11xxxxxx = compressed data
-#
-# Compressed data consists of:
-# %11xxxxxxx oooooooo oooooooo
-# This means that x+4 bytes (6-bit, max 67) from offset o (little-endian 16-bit)
-# should be consumed next. Such runs cannot "nest".
-
-# TODO support channel masking
-# TODO allow dropping custom instrument data
-
-#
-# Alternatively...
-# For tones, writes are always one of
-# 1x: all bits used but likely not changing by a large amount?
+# For tone channels, writes are always one of
+# 1x: all bits used but likely not changing by a large amount
 # 2x: top 2 bits unused
 # 3x: all bits used
-# And pauses. We could try for a one-byte encoding:
+# And pauses. To enable compression to be easier, we want a one-byte encoding.
 # %0000xxxx = set low nibble of register 1x
 # %0001xxxx = set high nibble of register 1x
 # %0010xxxx = set instrument
@@ -462,7 +486,7 @@ class RhythmChannel(Channel):
 # %11sxxyyy = small freq change + wait TODO
 # And for rhythm/custom instrument:
 # Writes are always to register $0e. Top 2 bits unused.
-# And pauses. We could try for a one-byte encoding:
+# And pauses. Again we want a one-byte encoding:
 # %00rkkkkk = set register $0e
 # %0100xxxx = set low nibble of custom register
 # %0101xxxx = set high nibble of custom register and increment index
@@ -472,6 +496,25 @@ class RhythmChannel(Channel):
 #             x = 0 => end of data
 #             x = 1 => loop point
 # This means the wait and compression parts are the same for both.
+
+
+class FMLibFile:
+    def __init__(self):
+        self.channels = [ToneChannel(index) for index in range(9)]
+        self.channels.append(RhythmChannel(9))
+
+    def save(self, filename: str):
+        # The end format is 20 bytes of pointers to per-channel data.
+        # A zero pointer will be used to indicate a channel is not used. TODO
+        with open(filename, "wb") as f:
+            lengths = [len(channel.data) for channel in self.channels]
+            offset = len(self.channels) * 2
+            for length in lengths:
+                f.write(offset.to_bytes(2, byteorder='little'))
+                offset += length
+            for channel in self.channels:
+                f.write(channel.data)
+
 
 def longest_match(needle, haystack, min_length, max_length):
     if len(haystack) < min_length or len(needle) < min_length:
@@ -484,34 +527,7 @@ def longest_match(needle, haystack, min_length, max_length):
     return 0, 0
 
 
-def compress(data):
-    # We work through the data a byte at a time. 
-    # For each byte, we check if it is the start of a run matching what we have seen already. 
-    # This is not optimal - where we have repeating data, we'd prefer to encoded a longer raw run
-    # than to encode just a few bytes and refer to it may times.
-    # We might also consider allowing cross-channel data references.
-    result = bytearray()
-    min_length = 4
-    max_length = 63 + min_length
-
-    position = 0
-    while position < len(data):
-        offset, length = longest_match(data[position:position + max_length], result, min_length, max_length)
-        if length == 0:
-            result.append(data[position])
-            position += 1
-        else:
-            print(f"position={position} match length {length}")
-            result.append(0b11000000 + length - 4)
-            result.extend(offset.to_bytes(2, byteorder='little'))
-            position += length
-
-    print(f"Compressed {len(data)} to {len(result)}")
-    return result
-
-
-def compress2(chunks, min_length):
-    size_before = sum([len(chunk) for chunk in chunks])
+def compress2(data: bytes, min_length: int) -> bytes:
     max_length = 31 + min_length - 2  # 5 bits length, 2 reserved
     print(f"compressing with min length {min_length} -> max length {max_length}")
 
@@ -522,7 +538,8 @@ def compress2(chunks, min_length):
     # A run of length 50 that is found 3 times will cost 50 bytes for the first run, 
     #   then 3 bytes for each repeat, so it will save 94 bytes to use it.
     # If a run of data is chosen as "best", it is still valid to use it as a source for
-    # other matching sub-runs later on, but not to substitute data within it.
+    # other matching sub-runs later on, but not to substitute data within it. We do not
+    # count these "submatches" towards the decision to pick that run, though.
     # Thus:
     # - We need to split the data into sets of:
     #   1. Runs referenced elsewhere, which may not be altered
@@ -532,20 +549,9 @@ def compress2(chunks, min_length):
     # This gets complicated fast...
 
     runs = []  # will be tuples of start, end
-    pointers = set()  # will be offsets of the pointers themselves (value can be read back)
-
-    # First we assemble the data into the uncompressed final form
-    data = bytearray()
-    header_size = len(chunks) * 2
-    # Fill in pointers
-    offset = header_size
-    for chunk in chunks:
-        pointers.add(len(data))
-        data.extend(offset.to_bytes(2, byteorder='little'))
-        offset += len(chunk)
-    # Then append the data itself
-    for chunk in chunks:
-        data.extend(chunk)
+    pointers = set(range(0, int.from_bytes(data[0:2], byteorder='little'), 2))
+    # will be offsets of the pointers themselves (value can be read back)
+    # we populate with the existing header
 
     print(f"Before compression: {len(data)} bytes")
     with open("before.bin", "wb") as f:
@@ -555,16 +561,18 @@ def compress2(chunks, min_length):
     # We define "best" as "the most bytes will be saved with this one substitution". This is not optimal: some of those
     # substitutions may de-optimise future match opportunities.
     next_print_time = time.time() + 0.1
+    round = 1
     while True:
         best_savings = 0
         max_position = len(data) - min_length
         tried_needles = set()
+
         # For each position in the data...
         for position in range(0, max_position):
             if time.time() > next_print_time:
                 print(f"{position}/{max_position}, best: {best_savings}", end="\r")
                 next_print_time += 0.1
-            if position-1 in pointers or position in pointers or position+1 in pointers:
+            if position - 1 in pointers or position in pointers or position + 1 in pointers:
                 # not a valid source
                 continue
             # For each possible run length...
@@ -574,6 +582,8 @@ def compress2(chunks, min_length):
                 # Skip if already done
                 s = str(run)
                 if s in tried_needles:
+                    # Note that this can miss opportunities. If the needle is in a replaceable area but the match is
+                    # in an existing run, then it cannot be used. However, it may be used the other wat round.
                     continue
                 tried_needles.add(s)
                 # Find matches after the run itself
@@ -594,16 +604,19 @@ def compress2(chunks, min_length):
         # Next, try to substitute it.
         if best_savings > 0:
             (position, length, matches) = best_match
-            print(f"Offset {position} length {length} matches {len(matches)} places, saving {best_savings} bytes")
-            # Record the run so we don't mess with its data in future
-            runs.append((position, position + length))
+            print(
+                f"Round {round}: offset 0x{position:x} length {length} matches {len(matches)} places, saving {best_savings} bytes")
             # Calculate the savings per match
             bytes_saved_per_match = length - 3
-            # The matches refer to positions before the data is spliced - we need to adjust them
+            # The matches refer to positions before the data is spliced - we adjust them in advance
             for n in range(len(matches)):
                 matches[n] -= bytes_saved_per_match * n
             # Now replace them
             for match in matches:
+                # If the match is before the data position, we need to adjust the position to account for the
+                # shift we are about to make, before we write it
+                if match < position:
+                    position -= bytes_saved_per_match
                 # Replace the bytes in the data
                 splice(data, match, position, length)
                 # We need to adjust the pointers and runs after it as their locations have changed.
@@ -629,6 +642,13 @@ def compress2(chunks, min_length):
                     # Could make a mutable object here?
                     runs.remove((start, end))
                     runs.append((start - bytes_saved_per_match, end - bytes_saved_per_match))
+
+            # Record the run so we don't mess with its data in future
+            runs.append((position, position + length))
+
+            with open(f"round{round}.bin", "wb") as f:
+                f.write(data)
+            round += 1
         else:
             print("No more matches found")
             break
@@ -654,7 +674,7 @@ def find_matches(needle, haystack, pointers, runs):
         invalid = False
         for x in range(offset, offset + len(needle)):
             # Pointers are generally 3 bytes, we have the offset of the middle byte here
-            if x-1 in pointers or x in pointers or x+1 in pointers:
+            if x - 1 in pointers or x in pointers or x + 1 in pointers:
                 # Matched a pointer (or the byte before it, which is the marker)
                 invalid = True
                 break
@@ -680,7 +700,7 @@ def find_matches(needle, haystack, pointers, runs):
             offset += len(needle)
 
 
-def save(data, filename):
+def save(data: bytes, filename: str):
     # The end format is 20 bytes of pointers to per-channel data.
     # A zero pointer will be used to indicate a channel is not used. TODO
     with open(filename, "wb") as f:
@@ -694,210 +714,43 @@ def save(data, filename):
             f.write(chunk)
 
 
-def convert(filename):
+def convert(filename: str) -> FMLibFile:
     file = VgmFile(filename)
-    print(f"Loaded file, size is {len(file.data)}")
+    print(f"Loaded \"{filename}\", VGM data has {len(file.data)} commands")
     print(f"Data starts at {file.data_offset:#x}")
     print(f"Data loops at {file.loop_offset:#x}")
     print(f"Data ends at {file.eof_offset:#x}")
 
-    channels = {}
-    for index in range(9):
-        channels[index] = ToneChannel(index)
+    print(f"Converting to FMLib (unoptimised)...")
+    result = FMLibFile()
 
-    channels[9] = RhythmChannel()
-
-    # Parse the file into memory
-    commands = [command for command in file.commands()]
-
-    first_key_channel = 0
-    for line in commands:
-        if type(line) is Command:
-            if line.register >= 0x20 and line.register <= 0x28 and line.data & 0b00010000 != 0:
-                # It's a key press
-                first_key_channel = line.register & 0xf
-                print(f"First key press is {line} for channel {first_key_channel}")
-                break
-
-    for line in commands:
-        print(line)
-        if type(line) is Wait:
-            for i in channels:
-                channels[i].wait(line.length)
-        elif type(line) is LoopPoint:
-            for i in channels:
-                channels[i].add_loop()
-        elif type(line) is Command:
-            if line.register >= 0x10:
-                # tone register
-                channel = line.register & 0xf
-                if channel > 8:
-                    print(f"Unhandled command for register {line.register}")
-                    continue  # shouldn't happen
-                if line.register & 0xf0 == 0x10:
-                    channels[channel].reg1x(line.data)
-                elif line.register & 0xf0 == 0x20:
-                    channels[channel].reg2x(line.data)
-                else:
-                    channels[channel].reg3x(line.data)
-            elif line.register == 0x0e:
-                # rhythm
-                channels[9].write(line.data)
-            elif line.register <= 0x08:
-                # custom instrument, we load that onto the channel with the first key down
-                channels[first_key_channel].add_custom(line.register, line.data)
-            else:
-                # Something else
-                print(f"Unhandled command for register {line.register}")
-
-    # Terminate
-    for index in channels:
-        # Write any remaining waits
-        channels[index].write_data()
-        channels[index].terminate()
-
-    # Print some stuff
-    for index in channels:
-        print(f"ch{index} data = {len(channels[index].data)} bytes")
-
-    # Save uncompressed
-    save([channels[index].data for index in channels], filename + ".fm")
-
-    # Compression time...
-    save([compress(channels[index].data) for index in channels], filename + ".compressed.fm")
-
-
-class SimpleChannel(Channel):
-    def __init__(self):
-        super().__init__()
-
-    def write(self, data):
-        self.data.append(data)
-
-
-class ToneChannel2(Channel):
-    def __init__(self):
-        super().__init__()
-        self.pendingData = bytearray()
-        self.r1 = 0
-        self.r2 = 0
-        self.r3 = 0
-        self.oldr1 = 0
-
-    def reg1x(self, b):
-        self.maybe_write_data()
-
-        # F-Num low bits
-        if b & 0x0f != self.r1 & 0x0f:
-            self.pendingData.append(0b00000000 | ((b >> 0) & 0b00001111))
-        if b & 0xf0 != self.r1 & 0xf0:
-            self.pendingData.append(0b00010000 | ((b >> 4) & 0b00001111))
-        self.r1 = b
-
-    def reg2x(self, b):
-        self.maybe_write_data()
-
-        # F-Num high bit, block, key, sustain
-        b &= 0b00111111
-        if b != self.r2:
-            self.pendingData.append(0b01000000 | b)
-        self.r2 = b
-
-    def reg3x(self, b):
-        self.maybe_write_data()
-
-        if b & 0xf != self.r3 & 0xf:
-            # Volume
-            self.pendingData.append(0b00110000 | ((b >> 0) & 0b00001111))
-        if b & 0xf0 != self.r3 & 0xf0:
-            # Instrument
-            self.pendingData.append(0b00100000 | ((b >> 4) & 0b00001111))
-        self.r3 = b
-
-    def add_loop(self):
-        self.write_data()
-        self.data.append(0b10100001)
-
-    def terminate(self):
-        self.write_data()
-        self.data.append(0b10100000)
-
-    def write_data(self):
-        # This is called when we need to flush the pending data before a pause
-        frames = self.waits // 735
-
-        # Check if we have a small frequency change + small pause as we optimise that for vibrato
-        isOnlySmallFrequencyChange = True
-        for b in self.pendingData:
-            # Anything other than %000xxxxx is something else 
-            if b & 0b11100000 != 0:
-                isOnlySmallFrequencyChange = False
-                break
-        # Now check if it is small enough
-        delta = abs(self.r1 - self.oldr1)
-        if isOnlySmallFrequencyChange and delta <= 4 and delta > 0:
-            # Optimised for vibrato
-            sign = 0 if delta > 0 else 1
-            value = abs(delta)
-            framesToConsume = min(8, frames)
-            # print(f"optimised vibrato: delta={delta} value={value} framesToConsume={framesToConsume}")
-            self.data.append(0b11000000 | (sign << 5) | ((value - 1) << 3) | (framesToConsume - 1))
-            frames -= framesToConsume
-        else:
-            # Emit the data as-is
-            # print(f"Emitted {len(self.pendingData)} pending bytes")
-            self.data.extend(self.pendingData)
-
-        self.pendingData.clear()  # TODO does this exist?
-        self.oldr1 = self.r1
-
-        # Then any remaining waits
-        # print(f"Wait {frames} frames")
-        while frames > 0:
-            framesToConsume = min(32, frames)
-            self.data.append(0b10000000 | (framesToConsume - 1))
-            frames -= framesToConsume
-            self.waits -= framesToConsume * 735
-
-
-def convert2(filename):
-    file = VgmFile(filename)
-    print(f"Loaded file, size is {len(file.data)}")
-    print(f"Data starts at {file.data_offset:#x}")
-    print(f"Data loops at {file.loop_offset:#x}")
-    print(f"Data ends at {file.eof_offset:#x}")
-
-    channels = {}
-    for index in range(9):
-        channels[index] = ToneChannel2()
-
-    for line in file.commands():
+    for command in file.commands():
         # print(line)
-        if type(line) is Wait:
-            for i in channels:
-                channels[i].wait(line.length)
-        elif type(line) is LoopPoint:
-            for i in channels:
-                channels[i].add_loop()
-        elif type(line) is Command:
-            if line.register >= 0x10:
+        if type(command) is Wait:
+            for channel in result.channels:
+                channel.wait(command.length)
+        elif type(command) is LoopPoint:
+            for i in result.channels:
+                channel.add_loop()
+        elif type(command) is Ym2413Command:
+            if command.register >= 0x10:
                 # tone register
-                channel = line.register & 0xf
+                channel = command.register & 0xf
                 if channel > 8:
-                    print(f"Unhandled command for register {line.register}")
+                    print(f"Unhandled command for register {command.register}")
                     continue  # shouldn't happen
 
-                if line.register & 0xf0 == 0x10:
-                    channels[channel].reg1x(line.data)
-                elif line.register & 0xf0 == 0x20:
-                    channels[channel].reg2x(line.data)
-                else:
-                    channels[channel].reg3x(line.data)
-            elif line.register == 0x0e:
+                if command.register & 0xf0 == 0x10:
+                    result.channels[channel].reg1x(command.data)
+                elif command.register & 0xf0 == 0x20:
+                    result.channels[channel].reg2x(command.data)
+                elif command.register & 0xf0 == 0x30:
+                    result.channels[channel].reg3x(command.data)
+            elif command.register == 0x0e:
                 # rhythm
-                # channels[9].write(line.data & 0b00111111)
+                result.channels[9].write(command.data)
                 pass
-            elif line.register <= 0x08:
+            elif command.register <= 0x08:
                 # We want to bunch these up into groups of 8
                 # For now, let's assume there's always 8 of them? TODO
                 # channels[9].write(0b01000000 | ((line.data >> 0) & 0b00001111))
@@ -905,46 +758,83 @@ def convert2(filename):
                 pass
             else:
                 # Something else
-                print(f"Unhandled command for register {line.register}")
-
-    # Terminate
-    for index in channels:
-        channels[index].terminate()
+                print(f"Unhandled command for register {command.register}")
 
     # Print some stuff
-    for index in channels:
-        print(f"ch{index} data = {len(channels[index].data)} bytes")
+    for channel in result.channels:
+        print(f"ch{channel.index} data = {len(channel.data)} bytes")
 
-    print(f"Total data size = {sum([len(channels[index].data) for index in channels])} bytes")
+    print(f"Total data = {sum([len(x.data) for x in result.channels])} bytes")
 
     # Save uncompressed
-    save([channels[index].data for index in channels], filename + ".fm2")
+    result.save(filename + ".pass1.fmlib")
 
+
+def foo():
     # Compression time...
-    for i in range(4, 64):
-        compressed = compress2([channels[index].data for index in channels], i)
+
+    # First we assemble the data into the uncompressed final form
+    data = bytearray()
+    chunks = [channels[index].data for index in channels]
+    header_size = len(chunks) * 2
+    # Fill in pointers
+    offset = header_size
+    for chunk in chunks:
+        data.extend(offset.to_bytes(2, byteorder='little'))
+        offset += len(chunk)
+    # Then append the data itself
+    for chunk in chunks:
+        data.extend(chunk)
+
+    for i in range(4, 5):
+        compressed = compress2(data, i)
         print(f"Compressed to {len(compressed)} with min length {i}")
         with open(f"{filename}.compressed.{i}.fm2", "wb") as f:
             f.write(compressed)
 
 
 def testcompress2():
-    data = "ABCDxABCDEFGHIJyABCDEFGHIJzABCDEFGHIJaABCDEFGHIJbABCDEFGHIJ".encode(encoding='ascii')
-    compressed = compress2([data], 4)
+    data = bytearray()
+    data.extend(int(2).to_bytes(length=2, byteorder='little'))
+    data.extend("ABCDExABCDEFGHIJyABCDEFGHIJzABCDEFGHIJaABCDEFGHIJbABCDEFGHIJ".encode(encoding='ascii'))
+    compressed = compress2(data, 4)
     with open("testcompressed.bin", "wb") as f:
         f.write(compressed)
-    print(f"{len(data)+2} -> {len(compressed)}")
+    print(f"{len(data) + 2} -> {len(compressed)}")
+
 
 def main():
     verb = sys.argv[1]
-    if verb == 'convert':
-        convert(sys.argv[2])
-    elif verb == 'convert2':
-        convert2(sys.argv[2])
+    if verb == "print":
+        # Test the VGM parsing
+        f = VgmFile(sys.argv[2])
+        for c in f.commands():
+            print(c)
+    elif verb == "convert":
+        f = convert(sys.argv[2])
+    elif verb == 'convert':
+        save(convert2(sys.argv[2]), sys.argv[2] + ".fm")
     elif verb == 'testcompress2':
         testcompress2()
+    elif verb == 'compress2':
+        with open(sys.argv[2], "rb") as f:
+            compress2(f.read(), 4)
     else:
         raise Exception(f"Unknown verb \"{verb}\"")
+
+
+class Test(unittest.TestCase):
+    def test_compress(self):
+        data = bytearray()
+        data.extend(int(2).to_bytes(length=2, byteorder='little'))
+        data.extend("ABCDExABCDEFGHIJyABCDEFGHIJzABCDEFGHIJaABCDEFGHIJbABCDEFGHIJ".encode(encoding='ascii'))
+        # ABCDExABCDEFGHIJyABCDEFGHIJzABCDEFGHIJaABCDEFGHIJbABCDEFGHIJ
+        #       ^^^^^^^^^^-^^^^^^^^^^-^^^^^^^^^^-^^^^^^^^^^-^^^^^^^^^^
+        # ABCDExABCDEFGHIJy[]z[]a[]b[]
+        #       ^^^^^
+        # []xABCDEFGHIJy[]z[]a[]b[]
+        compressed = compress2(data, 4)
+        assert compressed == bytearray.fromhex("00")
 
 
 if __name__ == "__main__":
