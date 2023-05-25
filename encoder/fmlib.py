@@ -88,41 +88,19 @@ class VgmFile:
 
 
 # Next we make classes which represent single channels in the YM2413.
-# These process the write commands into some internal state, and then manage writing 
-# that state to the FMLib binary format.
-
-class Channel:
-    """This is a base for ToneChannel and RhythmChannel. It accumulates wait commands."""
-
-    def __init__(self):
-        self.waits = 0
-        self.data = bytearray()
-
-    def wait(self, length):
-        # We may get multiple pauses, so we accumulate them
-        self.waits += length
-
-    def maybe_write_data(self):
-        # We write if we have accumulated pauses
-        if self.waits < 735:
-            return
-        self.write_data()
-
-    def write_data(self):
-        # Default implementation
-        pass
-
+# These process the write commands into the FMLib binary format.
 
 class ChannelBase:
     """A channel with some data"""
 
-    def __init__(self, index: int):
+    def __init__(self, index: int, frame_length: int = 735):
         self.data = bytearray()
         self.index = index
         self.wait_samples = 0
+        self.frame_length = frame_length
 
     def add_loop(self):
-        self.emit_wait()
+        self.emit_wait_if_needed()
         self.data.append(0b10100001)
 
     def wait(self, length: int):
@@ -131,20 +109,22 @@ class ChannelBase:
         # We do that by accumulating and writing them later.
         self.wait_samples += length
 
-    def emit_wait(self):
-        while self.wait_samples > 735:
-            frames = min(self.wait_samples // 735, 32)
+    def emit_wait_if_needed(self):
+        while self.wait_samples > self.frame_length:
+            frames = min(self.wait_samples // self.frame_length, 32)
+            # Waits: %100xxxxx for x+1 frames (min 1, max 32)
             self.data.append((0b100 << 5) | (frames - 1))
-            self.wait_samples -= frames * 735
+            self.wait_samples -= frames * self.frame_length
 
     def end(self):
-        self.emit_wait()
+        self.emit_wait_if_needed()
         self.data.append(0b10100000)
 
     def __str__(self):
         return f"ch{self.index}[{len(self.data)}]"
 
-    def append_if_changed(self, prefix: int, mask: int, old_value: int, new_value: int, shift: int):
+    def append_if_changed(self, prefix: int, shift: int, mask: int, old_value: int, new_value: int):
+        """Append prefix | ((new_value >> shift) & mask) if the relevant bits are different to old_value"""
         new_value >>= shift
         new_value &= mask
         if old_value != -1:
@@ -163,272 +143,44 @@ class ToneChannel(ChannelBase):
         self.reg3 = -1
 
     def reg1x(self, b: int):
-        self.emit_wait()
+        self.emit_wait_if_needed()
         # Only emit changes
-        self.append_if_changed(0b00000000, 0b1111, self.reg1, b, 0)
-        self.append_if_changed(0b00010000, 0b1111, self.reg1, b, 4)
+        self.append_if_changed(0b00000000, 0, 0b1111, self.reg1, b)
+        self.append_if_changed(0b00010000, 4, 0b1111, self.reg1, b)
         self.reg1 = b
 
     def reg2x(self, b: int):
-        self.emit_wait()
-        self.append_if_changed(0b01000000, 0b111111, self.reg2, b, 0)
+        self.emit_wait_if_needed()
+        self.append_if_changed(0b01000000, 0, 0b111111, self.reg2, b)
         self.reg2 = b
 
     def reg3x(self, b: int):
-        self.emit_wait()
-        self.append_if_changed(0b00100000, 0b1111, self.reg3, b, 0)
-        self.append_if_changed(0b00110000, 0b1111, self.reg3, b, 4)
+        self.emit_wait_if_needed()
+        self.append_if_changed(0b00100000, 0, 0b1111, self.reg3, b)
+        self.append_if_changed(0b00110000, 4, 0b1111, self.reg3, b)
         self.reg3 = b
+
 
 class RhythmChannel(ChannelBase):
     def __init__(self, index: int):
         super().__init__(index)
         self.value = -1
+        self.custom_instruments = [-1 for x in range(8)]
 
     def write(self, b: int):
-        self.emit_wait()
-        self.append_if_changed(0b00000000, 0b111111, self.value, b, 0)
+        self.emit_wait_if_needed()
+        self.append_if_changed(0b00000000, 0, 0b111111, self.value, b)
         self.value = b
 
-
-class OldToneChannel(Channel):
-    @dataclass
-    class ToneState:
-        instrument: int = 0
-        volume: int = 0
-        key: bool = False
-        block: int = 0
-        fnum: int = 0
-        sustain: bool = False
-        key_change_count: int = 0
-
-    def __init__(self, index):
-        super().__init__()
-        self.channel = index
-        self.state = self.ToneState()
-        self.last_state = self.ToneState()
-        self.custom_instrument = [0, 0, 0, 0, 0, 0, 0, 0]
-        self.custom_instrument_changed = False
-
-    # When registers are written, we extract the data from them into self.state.
-    # We want to dump out the accumulated change only when we get to a wait.
-    # However, we also want to accumulate that wait together with the change,
-    # in the case where the wait is small.
-    # Thus, we write to our internal data stream when we see a register write
-    # at a time after at least one frame of pauses has been seen; so we call
-    # maybe_write_data() before handling each update. This will emit (data)(pause)
-    # if pause is >0 frames, and do nothing (i.e. accumulate more data) if it
-    # is <1 frame.
-
-    def reg1x(self, b):
-        self.maybe_write_data()
-        # F-Num low bits
-        self.state.fnum = (self.state.fnum & 0x100) | b
-        print(self.state)
-
-    def reg2x(self, b):
-        self.maybe_write_data()
-        # F-Num high bit
-        self.state.fnum = (self.state.fnum & 0x0ff) | ((b & 0b1) << 8)
-        # Block
-        self.state.block = (b >> 1) & 0b111
-        # Key
-        old_key = self.state.key
-        self.state.key = b & 0b00010000 != 0
-        if self.state.key != old_key:
-            self.state.key_change_count += 1
-        # Sustain
-        self.state.sustain = b & 0b00100000 != 0
-        print(self.state)
-
-    def reg3x(self, b):
-        self.maybe_write_data()
-        # Volume
-        self.state.volume = b & 0b1111
-        # Instrument
-        self.state.instrument = b >> 4
-        print(self.state)
-
-    def add_custom(self, index, data):
-        if self.custom_instrument[index] != data:
-            self.custom_instrument[index] = data
-            self.custom_instrument_changed = True
-
-    def add_loop(self):
-        self.write_data()
-        self.data.append(0b10000011)
-
-    def emit_key_up(self):
-        print(f"ch{self.channel}: Key up")
-        self.data.append(0b10000000)
-
-    def write_data(self):
-        # We want to encode some data for what's changed since last time, then the pause (if non-zero)
-        frames = self.waits // 735
-        delta = self.state.fnum - self.last_state.fnum
-
-        # If key has gone from down to up, we handle that first
-        need_key_up = False
-        if (not self.state.key) and self.last_state.key:
-            self.emit_key_up()
-            self.last_state.key = False
-            self.state.key_change_count = 0
-            # And we ignore any other changes... this is not quite VGM compatible as we are delaying those changes to the next key down
-            delta = 0
-        else:
-            # Check for multiple key changes. U-D-U would restart the note, D-U-D would give a short note.
-            if self.state.key_change_count > 1:
-                if self.state.key:
-                    # D-U-D: emit a key up
-                    print("D-U-D")
-                    self.emit_key_up()
-                else:
-                    # U-D-U: emit a key up later
-                    print("U-D-U")
-                    need_key_up = True
-            # Check for a large f-num change or other change affecting block, key(, sustain)
-            if delta < -4 or delta > 4 or self.state.block != self.last_state.block or self.state.sustain != self.last_state.sustain or self.state.key != self.last_state.key or frames == 0:
-                print(
-                    f"ch{self.channel}: Changed from key {self.last_state.key}, sustain {self.last_state.sustain}, block {self.last_state.block}, f-num {self.last_state.fnum} to key {self.state.key}, sustain {self.state.sustain}, block {self.state.block}, f-num {self.state.fnum}")
-                b = 0b10100000
-                if self.state.sustain:
-                    b |= 0b00010000
-                b |= self.state.fnum >> 8
-                b |= self.state.block << 1
-                self.data.append(b)
-                self.data.append(self.state.fnum & 0xff)
-                # Remember the changes
-                delta = 0
-                self.last_state.key = self.state.key
-                self.last_state.sustain = self.state.sustain
-                self.last_state.block = self.state.block
-                self.last_state.fnum = self.state.fnum
-                # This captures 3 or 6 bytes of VGM to 2 bytes
-
-                if need_key_up:
-                    self.emit_key_up()
-            self.state.key_change_count = 0
-
-            if self.state.volume != self.last_state.volume:
-                self.data.append(0b01100000 | self.state.volume)
-                self.last_state.volume = self.state.volume
-                print(f"ch{self.channel}: volume changed to {self.state.volume}")
-            if self.state.instrument != self.last_state.instrument:
-                self.data.append(0b01110000 | self.state.instrument)
-                self.last_state.instrument = self.state.instrument
-                print(f"ch{self.channel}: instrument changed to {self.state.instrument}")
-            # These two will expand 3 bytes to 1 or 2 bytes of data
-
-        if delta != 0:
-            # Must be a small change left over from above, not accompanied by anything else important
-            print(
-                f"ch{self.channel}: Changed f-num from {self.last_state.fnum} to {self.state.fnum} ({delta}) and wait is {frames} frames")
-            b = 0
-            frames_to_consume = min(frames,
-                                    8)  # We may not consume them all, and emit another byte for the remaining pause
-            if delta < 0:
-                b |= 0b00100000
-                delta *= -1
-            b |= delta << 2
-            b |= frames_to_consume - 1
-            self.data.append(b)
-            self.waits -= frames_to_consume * 735
-            # This captures 3-4 bytes of VGM to 1 byte
-
-        if self.custom_instrument_changed:
-            print("Custom instrument changed")
-            self.data.append(0b10000010)
-            for b in self.custom_instrument:
-                self.data.append(b)
-            self.custom_instrument_changed = False
-
-        if self.waits >= 735:
-            frames = self.waits // 735
-            print(f"ch{self.channel}: Pause {frames} frames")
-            self.waits -= frames * 735
-            while frames > 0:
-                b = 0b01000000
-                if frames <= 31:
-                    # 1-byte count
-                    b |= frames
-                    self.data.append(b)
-                    frames = 0
-                elif frames <= 255 + 31:
-                    # 2-byte count
-                    self.data.append(b)
-                    self.data.append(frames - 32)
-                    frames = 0
-                else:
-                    # 2-byte max count and loop
-                    self.data.append(b)
-                    self.data.append(255)
-                    frames -= 255 + 32
-
-    def terminate(self):
-        # We have space in the %100----- area
-        self.data.append(0b10000001)
-
-
-class OldRhythmChannel(Channel):
-    def __init__(self):
-        super().__init__()
-        self.value = 0
-        self.value_changed = False
-
-    def write(self, data):
-        self.maybe_write_data()
-        self.value = data & 0b00011111
-        self.value_changed = True
-
-    def add_loop(self):
-        self.write_data()
-        # A 1-length extended pause
-        self.data.append(0b10100000)
-        self.data.append(0b00000001)
-
-    def write_data(self):
-        frames = self.waits // 735
-
-        if self.value_changed:
-            if frames <= 4:
-                print(f"Rhythm: value changed to {self.value:05b}, then wait {frames} frames")
-                b = 0
-                b |= (frames - 1) << 5
-                b |= self.value & 0b00011111
-                self.data.append(b)
-                frames = 0
-            else:
-                print(f"Rhythm: value changed to {self.value:05b}")
-                b = 0b10000000
-                b |= self.value & 0b00011111
-                self.data.append(b)
-            self.value_changed = False
-
-        if frames > 0:
-            print(f"Rhythm: Pause {frames} frames")
-            self.waits -= frames * 735
-            while frames > 0:
-                b = 0b10100000
-                if frames <= 31:
-                    # 1-byte count
-                    b |= frames
-                    self.data.append(b)
-                    frames = 0
-                elif frames <= 255 + 30:  # 1 reserved length value
-                    # 2-byte count
-                    self.data.append(b)
-                    self.data.append(frames - 30)
-                    frames = 0
-                else:
-                    # 2-byte max count and loop
-                    self.data.append(b)
-                    self.data.append(255)
-                    frames -= 255 + 30
-
-    def terminate(self):
-        # A zero-length extended pause
-        self.data.append(0b10100000)
-        self.data.append(0b00000000)
+    def custom_instrument(self, index: int, value: int):
+        self.emit_wait_if_needed()
+        self.data.append(0b01000000 | index)
+        size = len(self.data)
+        self.append_if_changed(0b01010000, 0, 0b00001111, self.custom_instruments[index], value)
+        self.append_if_changed(0b01110000, 4, 0b00001111, self.custom_instruments[index], value)
+        if len(self.data) == size:
+            # Remove the index selector as it wasn't needed
+            del self.data[-1]
 
 
 # FMLib format speculation:
@@ -446,53 +198,21 @@ class OldRhythmChannel(Channel):
 # %01xxxxxx: 2x all bits
 # %0010xxxx: 3x instrument (if changed)
 # %0011xxxx: 3x volume (if changed)
-# %100xxxxx: wait x+1 frames
-# %101xxxxx: compression: x+3 bytes length, followed by offset (2 bytes)
+# %100xxxxx: wait x+1 frames (range 1..32)
+# %101xxxxx: compression: x+3 bytes length (range 3..34), followed by offset relative to start of file (2 bytes)
 # %10100000: end of data
 # %10100001: loop point
 # %11sxxyyy: small f-num change + wait:
 #   s = sign 
 #   xx = abs(change) - 1
 #   yyy = wait duration in frames
-
-# YM2413 tone registers cover:
-# 1x: F-Num low bits (8)
-# 2x: F-Num high bit (1); block (2); key (1); sustain (1)
-# 3x: volume (4); instrument (4)
-# * The note frequency is determined by F-Num * 2^block. This is likely to change very often.
-#   It may be altered by vibrato, which leads to a lot of small changes (typically +/- 1-4 F-Num).
-#   Block changes are less frequent.
-#   If we represent the note frequency as F-Num * 2^block then it is a 14-bit number.
-# * Key changes are of course the start and end of every note.
-#   These are more likely to be next to large note changes.
-# * Sustain seems likely to be changed less often than key
-# * Volume and instrument changes are rare
-# * Custom instrument may not be used at all, or if it is it's unlikely to change much
-# We therefore try to optimise for data as so:
-# For tone channels, writes are always one of
-# 1x: all bits used but likely not changing by a large amount
-# 2x: top 2 bits unused
-# 3x: all bits used
-# And pauses. To enable compression to be easier, we want a one-byte encoding.
-# %0000xxxx = set low nibble of register 1x
-# %0001xxxx = set high nibble of register 1x
-# %0010xxxx = set instrument
-# %0011xxxx = set volume
-# %01xxxxxx = set register 2x
-# %100xxxxx = wait up to 32 frames
-# %101xxxxx = compression, up to 34 bytes, followed by offset
-#             x = 0 => end of data
-#             x = 1 => loop point
-# %11sxxyyy = small freq change + wait TODO
 # And for rhythm/custom instrument:
-# Writes are always to register $0e. Top 2 bits unused.
-# And pauses. Again we want a one-byte encoding:
-# %00rkkkkk = set register $0e
-# %0100xxxx = set low nibble of custom register
-# %0101xxxx = set high nibble of custom register and increment index
-#             We always have a run of 16 of these so the code assumes it can manage a register index from 0..8
+# %00xxxxxx = set register $0e to x
+# %01000xxx = select custom instrument register x
+# %0101xxxx = set low nibble of custom register
+# %0111xxxx = set high nibble of custom register
 # %100xxxxx = wait up to 32 frames
-# %101xxxxx = compression, up to 34 bytes, followed by offset
+# %101xxxxx = compression, up to 34 bytes, followed by offset (2 bytes)
 #             x = 0 => end of data
 #             x = 1 => loop point
 # This means the wait and compression parts are the same for both.
@@ -749,19 +469,15 @@ def convert(filename: str) -> FMLibFile:
             elif command.register == 0x0e:
                 # rhythm
                 result.channels[9].write(command.data)
-                pass
             elif command.register <= 0x08:
-                # We want to bunch these up into groups of 8
-                # For now, let's assume there's always 8 of them? TODO
-                # channels[9].write(0b01000000 | ((line.data >> 0) & 0b00001111))
-                # channels[9].write(0b01010000 | ((line.data >> 4) & 0b00001111))
-                pass
+                result.channels[9].custom_instrument(command.register, command.data)
             else:
                 # Something else
                 print(f"Unhandled command for register {command.register}")
 
     # Print some stuff
     for channel in result.channels:
+        channel.end()
         print(f"ch{channel.index} data = {len(channel.data)} bytes")
 
     print(f"Total data = {sum([len(x.data) for x in result.channels])} bytes")
