@@ -2,6 +2,7 @@ import gzip
 import sys
 import time
 import unittest
+import io
 from dataclasses import dataclass
 
 
@@ -160,6 +161,67 @@ class ToneChannel(ChannelBase):
         self.append_if_changed(0b00110000, 4, 0b1111, self.reg3, b)
         self.reg3 = b
 
+    def optimise(self):
+        # We want to inspect the data. In each chunk of data between pauses, if all it does is change the frequency and
+        # then do a short pause, we can optimise that.
+        result = bytearray()
+        frequency = 0
+        last_frequency = 0
+        reg2 = 0
+        last_reg2 = 0
+        # First chunk up the data...
+        for chunk in self.get_chunks():
+            # Process the chunk
+            has_other_data = False
+            pause_length = 0
+            for b in chunk:
+                if b & 0b11110000 == 0b00000000:
+                    # Freq low nibble
+                    frequency &= 0b111110000
+                    frequency |= b & 0b1111
+                elif b & 0b11110000 == 0b00010000:
+                    # Freq high nibble
+                    frequency &= 0b100001111
+                    frequency |= (b & 0b1111) << 4
+                elif b & 0b11000000 == 0b01000000:
+                    # Freq high bit + other stuff
+                    frequency &= 0b011111111
+                    frequency |= (b & 1) << 8
+                    reg2 = b & 0b11111110
+                    if reg2 != last_reg2:
+                        has_other_data = True
+                elif b & 0b11100000 == 0b10000000:
+                    # Pause
+                    pause_length = (b & 0b11111) + 1
+                else:
+                    has_other_data = True
+
+            # Decide if it's optimisable
+            frequency_change = frequency - last_frequency
+            if abs(frequency_change) < 4 and 0 < pause_length < 9 and not has_other_data:
+                # Yes: alter the chunk to just that
+                sign = 1 if frequency_change < 0 else 0
+                chunk = [ 0b11000000 | (sign << 5) | (abs(frequency_change) << 3) | pause_length]
+
+            # Then pass the chunk through
+            result.extend(chunk)
+
+            # And remember the state
+            last_frequency = frequency
+            last_reg2 = reg2
+
+        # Finally replace our data
+        self.data = result
+
+    def get_chunks(self):
+        chunk = []
+        for b in self.data:
+            chunk.append(b)
+            if b & 0b10000000 != 0:
+                # All register writes start with a 0, everything else starts with a 1
+                yield chunk
+                chunk = []
+
 
 class RhythmChannel(ChannelBase):
     def __init__(self, index: int):
@@ -182,6 +244,10 @@ class RhythmChannel(ChannelBase):
             # Remove the index selector as it wasn't needed
             del self.data[-1]
 
+    def optimise(self):
+        # Nothing to do here
+        pass
+
 
 # FMLib format speculation:
 #
@@ -199,13 +265,13 @@ class RhythmChannel(ChannelBase):
 # %0010xxxx: 3x instrument (if changed)
 # %0011xxxx: 3x volume (if changed)
 # %100xxxxx: wait x+1 frames (range 1..32)
-# %101xxxxx: compression: x+3 bytes length (range 3..34), followed by offset relative to start of file (2 bytes)
+# %101xxxxx: compression: x+3 bytes length (range 5..34), followed by offset relative to start of file (2 bytes)
 # %10100000: end of data
 # %10100001: loop point
 # %11sxxyyy: small f-num change + wait:
 #   s = sign 
-#   xx = abs(change) - 1
-#   yyy = wait duration in frames
+#   xx = abs(change) - 1, change in range 1..4 inclusive
+#   yyy = wait duration in frames, minus 1, range 1..8 inclusive
 # And for rhythm/custom instrument:
 # %00xxxxxx = set register $0e to x
 # %01000xxx = select custom instrument register x
@@ -217,34 +283,148 @@ class RhythmChannel(ChannelBase):
 #             x = 1 => loop point
 # This means the wait and compression parts are the same for both.
 
-
 class FMLibFile:
     def __init__(self):
         self.channels = [ToneChannel(index) for index in range(9)]
         self.channels.append(RhythmChannel(9))
 
+    def __str__(self):
+        result = ""
+        for channel in self.channels:
+            result += f"ch{channel.index} data = {len(channel.data)} bytes\n"
+
+        result += f"Total data = {sum([len(x.data) for x in self.channels])} bytes"
+        return result
+
     def save(self, filename: str):
         # The end format is 20 bytes of pointers to per-channel data.
         # A zero pointer will be used to indicate a channel is not used. TODO
         with open(filename, "wb") as f:
-            lengths = [len(channel.data) for channel in self.channels]
-            offset = len(self.channels) * 2
-            for length in lengths:
-                f.write(offset.to_bytes(2, byteorder='little'))
-                offset += length
-            for channel in self.channels:
-                f.write(channel.data)
+            self.save_to(f)
+
+    def save_to(self, f: object):
+        lengths = [len(channel.data) for channel in self.channels]
+        offset = len(self.channels) * 2
+        for length in lengths:
+            f.write(offset.to_bytes(2, byteorder='little'))
+            offset += length
+        for channel in self.channels:
+            f.write(channel.data)
+
+    @dataclass
+    class Run:
+        data: bytearray
+        offset: int
+        is_source: bool
+
+    @dataclass
+    class Pointer:
+        offset: int
+
+    def compress(self):
+        print(f"Compressing...")
+        # Compression
+
+        # The data is split into runs of:
+        # - Pointers to other data. These are two bytes, pointing at data elsewhere in the blob.
+        #   When we remove some data, we may need to decrease the address pointed to.
+        # - Runs which are pointed to by other data. These are not candidates for further compression.
+        # - Everything else - candidates for compression
+
+        data = []
+        data_offset = len(self.channels) * 2
+        for channel in self.channels:
+            data.append(FMLibFile.Pointer(data_offset))
+            data_offset += len(channel.data)
+
+        # Add in the data itself
+        data_offset = len(self.channels) * 2
+        for channel in self.channels:
+            data.append(FMLibFile.Run(channel.data, data_offset, False))
+            data_offset += len(channel.data)
+
+        # Then we process it looking for the best "match". This will be a source range of bytes in a run, and a set of
+        # matched ranges of bytes in the same or other runs. We want to choose the "best" one.
+        best_match = self.find_best_match(data)
+
+    def find_best_match(self, data: list):
+        min_match_length = 4
+        max_match_length = 32 # TODO
+
+        runs: list[FMLibFile.Run] = [x for x in data if x is FMLibFile.Run]
+
+        for run in runs:
+            max_source_length = min(max_match_length, len(run.data))
+            for source_length in range(max_source_length, min_match_length - 1, -1):
+                for source_offset in range(0, len(run.data) - source_length):
+                    # Get the candidate data
+                    candidate = run.data[source_offset:source_offset + source_length]
+                    # Look for matches in all runs
+                    for other_run in runs:
+                        if other_run.is_source:
+                            # Can't compress these
+                            continue
+                        # Look for matches
+                        search_start = 0
+                        savings = 0
+                        while True:
+                            match_offset = other_run.data.find(candidate, search_start)
+
+    def old_fn(self):
+        # We look for the "best" runs in the data to compress first.
+        # "Best" means the one that saves the most bytes, for example:
+        # A run of length 4 that is found 50 times will cost 4 bytes for the first run,
+        #   then 3 bytes for each repeat, so it will save 49 bytes to use it.
+        # A run of length 50 that is found 3 times will cost 50 bytes for the first run,
+        #   then 3 bytes for each repeat, so it will save 94 bytes to use it.
+
+        # First we convert the file into a large bytearray.
 
 
-def longest_match(needle, haystack, min_length, max_length):
-    if len(haystack) < min_length or len(needle) < min_length:
-        return 0, 0
+        # We convert the data to a collection of:
+        # - Pointers to other data. These are at certain locations in the overall data.
+        # - Runs of bytes that are referenced by these pointers. These cannot be changed.
+        # - Runs of bytes that have not been processed yet. These are candidates for compression.
+        pointers = set()
+        fixed_runs = set()
+        candidate_runs = set()
+        # First we put the data into fmlib format in these forms...
+        data_offset = len(self.channels) * 2
+        for index in range(len(self.channels)):
+            pointers.add(Pointer(index * 2, data_offset))
+            candidate_runs.add(Run(data_offset, self.channels[index].data))
+            data_offset += len(self.channels[index].data)
 
-    for length in range(min(len(needle), len(haystack), max_length), min_length, -1):
-        offset = haystack.find(needle[:length])
-        if offset != -1:
-            return offset, length
-    return 0, 0
+        min_run_length = 4
+        max_run_length = 64  # TODO?
+
+        # Then we work through them...
+        for x in range(1):
+            # Try to find the best run to substitute
+
+            best_run = self.find_best_run(candidate_runs, max_run_length, min_run_length)
+
+            if best_run.source is None:
+                # We are done
+                break
+
+            # Else we substitute it
+            # First we need to splice it out of the candidates
+            candidate_runs.remove(best_run.source)
+            before, mid, after = best_run.splice()
+            if before is not None:
+                candidate_runs.add(before)
+            if after is not None:
+                candidate_runs.add(after)
+            fixed_runs.add(mid)
+
+            # Next we want to splice out all the matched parts
+
+    def optimise(self):
+        print("Optimising vibrato...")
+        for channel in self.channels:
+            channel.optimise()
+
 
 
 def compress2(data: bytes, min_length: int) -> bytes:
@@ -441,7 +621,7 @@ def convert(filename: str) -> FMLibFile:
     print(f"Data loops at {file.loop_offset:#x}")
     print(f"Data ends at {file.eof_offset:#x}")
 
-    print(f"Converting to FMLib (unoptimised)...")
+    print(f"Converting to FMLib...")
     result = FMLibFile()
 
     for command in file.commands():
@@ -475,48 +655,10 @@ def convert(filename: str) -> FMLibFile:
                 # Something else
                 print(f"Unhandled command for register {command.register}")
 
-    # Print some stuff
     for channel in result.channels:
         channel.end()
-        print(f"ch{channel.index} data = {len(channel.data)} bytes")
 
-    print(f"Total data = {sum([len(x.data) for x in result.channels])} bytes")
-
-    # Save uncompressed
-    result.save(filename + ".pass1.fmlib")
-
-
-def foo():
-    # Compression time...
-
-    # First we assemble the data into the uncompressed final form
-    data = bytearray()
-    chunks = [channels[index].data for index in channels]
-    header_size = len(chunks) * 2
-    # Fill in pointers
-    offset = header_size
-    for chunk in chunks:
-        data.extend(offset.to_bytes(2, byteorder='little'))
-        offset += len(chunk)
-    # Then append the data itself
-    for chunk in chunks:
-        data.extend(chunk)
-
-    for i in range(4, 5):
-        compressed = compress2(data, i)
-        print(f"Compressed to {len(compressed)} with min length {i}")
-        with open(f"{filename}.compressed.{i}.fm2", "wb") as f:
-            f.write(compressed)
-
-
-def testcompress2():
-    data = bytearray()
-    data.extend(int(2).to_bytes(length=2, byteorder='little'))
-    data.extend("ABCDExABCDEFGHIJyABCDEFGHIJzABCDEFGHIJaABCDEFGHIJbABCDEFGHIJ".encode(encoding='ascii'))
-    compressed = compress2(data, 4)
-    with open("testcompressed.bin", "wb") as f:
-        f.write(compressed)
-    print(f"{len(data) + 2} -> {len(compressed)}")
+    return result
 
 
 def main():
@@ -528,13 +670,15 @@ def main():
             print(c)
     elif verb == "convert":
         f = convert(sys.argv[2])
-    elif verb == 'convert':
-        save(convert2(sys.argv[2]), sys.argv[2] + ".fm")
-    elif verb == 'testcompress2':
-        testcompress2()
-    elif verb == 'compress2':
-        with open(sys.argv[2], "rb") as f:
-            compress2(f.read(), 4)
+        f.save(f"{sys.argv[2]}.pass1.fmlib")
+        print(f)
+    elif verb == "convert2":
+        f = convert(sys.argv[2])
+        f.save(f"{sys.argv[2]}.pass1.fmlib")
+        print(f)
+        f.optimise()
+        f.save(f"{sys.argv[2]}.pass2.fmlib")
+        print(f)
     else:
         raise Exception(f"Unknown verb \"{verb}\"")
 
