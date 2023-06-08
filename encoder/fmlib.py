@@ -2,8 +2,8 @@ import gzip
 import sys
 import time
 import unittest
-import io
 from dataclasses import dataclass
+from typing import BinaryIO
 
 
 # We define some classes to represent the data in a VGM file
@@ -201,7 +201,7 @@ class ToneChannel(ChannelBase):
             if abs(frequency_change) < 4 and 0 < pause_length < 9 and not has_other_data:
                 # Yes: alter the chunk to just that
                 sign = 1 if frequency_change < 0 else 0
-                chunk = [ 0b11000000 | (sign << 5) | (abs(frequency_change) << 3) | pause_length]
+                chunk = [0b11000000 | (sign << 5) | (abs(frequency_change) << 3) | pause_length]
 
             # Then pass the chunk through
             result.extend(chunk)
@@ -227,7 +227,7 @@ class RhythmChannel(ChannelBase):
     def __init__(self, index: int):
         super().__init__(index)
         self.value = -1
-        self.custom_instruments = [-1 for x in range(8)]
+        self.custom_instruments = [-1 for _ in range(8)]
 
     def write(self, b: int):
         self.emit_wait_if_needed()
@@ -265,7 +265,7 @@ class RhythmChannel(ChannelBase):
 # %0010xxxx: 3x instrument (if changed)
 # %0011xxxx: 3x volume (if changed)
 # %100xxxxx: wait x+1 frames (range 1..32)
-# %101xxxxx: compression: x+3 bytes length (range 5..34), followed by offset relative to start of file (2 bytes)
+# %101xxxxx: compression: x+2 bytes length (range 4..33), followed by offset relative to start of file (2 bytes)
 # %10100000: end of data
 # %10100001: loop point
 # %11sxxyyy: small f-num change + wait:
@@ -291,9 +291,9 @@ class FMLibFile:
     def __str__(self):
         result = ""
         for channel in self.channels:
-            result += f"ch{channel.index} data = {len(channel.data)} bytes\n"
+            result += f"{channel} "
 
-        result += f"Total data = {sum([len(x.data) for x in self.channels])} bytes"
+        result += f"Total {sum([len(x.data) for x in self.channels])} bytes"
         return result
 
     def save(self, filename: str):
@@ -302,7 +302,7 @@ class FMLibFile:
         with open(filename, "wb") as f:
             self.save_to(f)
 
-    def save_to(self, f: object):
+    def save_to(self, f: BinaryIO):
         lengths = [len(channel.data) for channel in self.channels]
         offset = len(self.channels) * 2
         for length in lengths:
@@ -310,6 +310,34 @@ class FMLibFile:
             offset += length
         for channel in self.channels:
             f.write(channel.data)
+
+    def print(self):
+        for channel in self.channels:
+            print(f"Channel {channel.index}")
+            for b in channel.data:
+                if (b & 0b11110000) == 0b00000000:
+                    print(f"{b:x} Register 1x low nibble -> {b & 0b1111:x}")
+                elif (b & 0b11110000) == 0b00010000:
+                    print(f"{b:x} Register 1x high nibble -> {b & 0b1111:x}")
+                elif (b & 0b11000000) == 0b01000000:
+                    print(f"{b:x} Register 2x -> {b & 0b00111111:x}")
+                elif (b & 0b11110000) == 0b00100000:
+                    print(f"{b:x} Register 3x instrument -> {b & 0b1111:x}")
+                elif (b & 0b11110000) == 0b00110000:
+                    print(f"{b:x} Register 3x volume -> {b & 0b1111:x}")
+                elif (b & 0b11100000) == 0b10000000:
+                    print(f"{b:x} Wait {(b & 0b11111) + 1} frames")
+                elif b == 0b10100000:
+                    print(f"{b:x} End of data")
+                elif b == 0b10100001:
+                    print(f"{b:x} Loop point")
+                elif (b & 0b11100000) == 0b10100000:
+                    print(f"{b:x} compression")
+                elif (b & 0b11000000) == 0b11000000:
+                    print(f"{b:x} Vibrato: frequency {'-' if b & 0b100000 > 0 else '+'}{((b & 0b11000) >> 3) + 1}"
+                          f" then wait {(b & 0b111) + 1} frames")
+                else:
+                    print(f"{b:x} Unexpected!")
 
     @dataclass
     class Run:
@@ -321,110 +349,132 @@ class FMLibFile:
     class Pointer:
         offset: int
 
-    def compress(self):
+    def compress(self) -> None:
         print(f"Compressing...")
-        # Compression
+        start_time = time.time()
 
-        # The data is split into runs of:
-        # - Pointers to other data. These are two bytes, pointing at data elsewhere in the blob.
-        #   When we remove some data, we may need to decrease the address pointed to.
-        # - Runs which are pointed to by other data. These are not candidates for further compression.
-        # - Everything else - candidates for compression
+        # We maintain a set of pointer offsets in each channel, initially empty
+        pointers: list[set[int]] = [set[int]() for _ in self.channels]
+        # And ranges of "fixed" bytes. These are referenced elsewhere so may not be changed.
+        runs: list[set[int, int]] = [set[int, int]() for _ in self.channels]
 
-        data = []
-        data_offset = len(self.channels) * 2
+        # Find the best candidate for compression.
+        # This is the run of bytes in the current data which will save the most bytes if we convert other data to
+        # point to it.
+        best_savings = 0
+        best_length = 0
+        best_matches = []
+        next_print_time = time.time() + 0.1
+        # One optimisation is to not try the same sequence of bytes more than once.
+        tried_runs = set[str]()
         for channel in self.channels:
-            data.append(FMLibFile.Pointer(data_offset))
-            data_offset += len(channel.data)
+            # Find candidate runs in this channel
+            max_run_length = 33
+            min_run_length = 4  # TODO is it better to skew this range?
+            # We consider all run lengths that don't overlap existing pointers
+            for offset in range(len(channel.data) - min_run_length):
+                # If it starts in a pointer, skip it
+                if offset in pointers or offset + 1 in pointers:
+                    continue
+                # We do consider sources that overlap existing runs. However, targets must be replaceable.
 
-        # Add in the data itself
-        data_offset = len(self.channels) * 2
-        for channel in self.channels:
-            data.append(FMLibFile.Run(channel.data, data_offset, False))
-            data_offset += len(channel.data)
+                if time.time() > next_print_time:
+                    print(f"ch{channel.index} {offset}/{len(channel.data)}, best: {best_savings} "
+                          f"with run length {best_length} matching {len(best_matches)} places", end="\r")
+                    next_print_time += 0.1
 
-        # Then we process it looking for the best "match". This will be a source range of bytes in a run, and a set of
-        # matched ranges of bytes in the same or other runs. We want to choose the "best" one.
-        best_match = self.find_best_match(data)
+                # Then try all the lengths
+                for run_length in range(min_run_length, max_run_length + 1):
+                    # Check if we have hit a pointer
+                    if offset + run_length in pointers:
+                        # If so, don't try this or any longer length
+                        break
+                    # Else this is a candidate run
+                    candidate_run = channel.data[offset:offset + run_length]
 
-    def find_best_match(self, data: list):
-        min_match_length = 4
-        max_match_length = 32 # TODO
+                    # Don't consider runs we've seen before
+                    s = str(candidate_run)
+                    if s in tried_runs:
+                        continue
+                    tried_runs.add(s)
 
-        runs: list[FMLibFile.Run] = [x for x in data if x is FMLibFile.Run]
+                    # Measure its effectiveness
+                    matches, savings = self.find_matches(candidate_run, offset, channel)
 
-        for run in runs:
-            max_source_length = min(max_match_length, len(run.data))
-            for source_length in range(max_source_length, min_match_length - 1, -1):
-                for source_offset in range(0, len(run.data) - source_length):
-                    # Get the candidate data
-                    candidate = run.data[source_offset:source_offset + source_length]
-                    # Look for matches in all runs
-                    for other_run in runs:
-                        if other_run.is_source:
-                            # Can't compress these
-                            continue
-                        # Look for matches
-                        search_start = 0
-                        savings = 0
-                        while True:
-                            match_offset = other_run.data.find(candidate, search_start)
+                    if savings == 0:
+                        # If we don't find this run then we won't find any longer ones with the same prefix
+                        break
 
-    def old_fn(self):
-        # We look for the "best" runs in the data to compress first.
-        # "Best" means the one that saves the most bytes, for example:
-        # A run of length 4 that is found 50 times will cost 4 bytes for the first run,
-        #   then 3 bytes for each repeat, so it will save 49 bytes to use it.
-        # A run of length 50 that is found 3 times will cost 50 bytes for the first run,
-        #   then 3 bytes for each repeat, so it will save 94 bytes to use it.
+                    if savings > best_savings:
+                        best_savings = savings
+                        best_matches = matches
+                        best_channel = channel
+                        best_offset = offset
+                        best_length = run_length
 
-        # First we convert the file into a large bytearray.
+        print(f"Best saving is channel {best_channel.index} offset {best_offset} length {best_length}, "
+              f"saving {best_savings} bytes with {len(best_matches)} matches")
 
+        for b in best_channel.data[best_offset:best_offset + best_length]:
+            print(f"{b:02x} ", end="")
 
-        # We convert the data to a collection of:
-        # - Pointers to other data. These are at certain locations in the overall data.
-        # - Runs of bytes that are referenced by these pointers. These cannot be changed.
-        # - Runs of bytes that have not been processed yet. These are candidates for compression.
-        pointers = set()
-        fixed_runs = set()
-        candidate_runs = set()
-        # First we put the data into fmlib format in these forms...
-        data_offset = len(self.channels) * 2
-        for index in range(len(self.channels)):
-            pointers.add(Pointer(index * 2, data_offset))
-            candidate_runs.add(Run(data_offset, self.channels[index].data))
-            data_offset += len(self.channels[index].data)
+        print("")
+        print(f"Finished in {time.time() - start_time} seconds")
 
-        min_run_length = 4
-        max_run_length = 64  # TODO?
-
-        # Then we work through them...
-        for x in range(1):
-            # Try to find the best run to substitute
-
-            best_run = self.find_best_run(candidate_runs, max_run_length, min_run_length)
-
-            if best_run.source is None:
-                # We are done
-                break
-
-            # Else we substitute it
-            # First we need to splice it out of the candidates
-            candidate_runs.remove(best_run.source)
-            before, mid, after = best_run.splice()
-            if before is not None:
-                candidate_runs.add(before)
-            if after is not None:
-                candidate_runs.add(after)
-            fixed_runs.add(mid)
-
-            # Next we want to splice out all the matched parts
-
-    def optimise(self):
+    def optimise(self) -> None:
         print("Optimising vibrato...")
         for channel in self.channels:
             channel.optimise()
 
+    @staticmethod
+    def get_candidate_runs(channel: ChannelBase, pointers: set[int]) -> (bytearray, int):
+        max_run_length = 33
+        min_run_length = 4  # TODO is it better to skew this range?
+        # We consider all run lengths that don't overlap existing pointers
+        for offset in range(len(channel.data) - min_run_length):
+            # If it starts in a pointer, skip it
+            if offset in pointers or offset + 1 in pointers:
+                continue
+            # We do consider sources that overlap existing runs. However, targets must be replaceable.
+
+            # Then try all the lengths
+            for run_length in range(min_run_length, max_run_length + 1):
+                # Check if we have hit a pointer
+                if offset + run_length in pointers:
+                    # If so, don't try this or any longer length
+                    break
+                # Else this is a candidate run
+                yield channel.data[offset:offset + run_length], offset
+
+    def find_matches(self, candidate_run: bytearray, source_offset: int, source_channel: ChannelBase) \
+            -> (set[(int, int)], int):
+        savings = 0
+        matches = set[(int, int)]()
+        for channel in self.channels:
+            # Look for the candidate run in its data
+            # If it's the source channel, exclude the source run itself
+            search_start = 0
+            search_end = len(channel.data)
+            while search_start <= search_end - len(candidate_run):
+                # TODO this will match on pointer values!?
+                offset = channel.data.find(candidate_run, search_start, search_end)
+                if offset == -1:
+                    # Not found
+                    search_start = search_end
+                    continue
+                # We found it!
+                # Was it the original, or something overlapping it?
+                if channel == source_channel:
+                    if source_offset <= offset < source_offset + len(candidate_run):
+                        # Search after it
+                        search_start = source_offset + len(candidate_run)
+                        continue
+                # A pointer costs 3 bytes
+                savings += len(candidate_run) - 3
+                search_start = offset + len(candidate_run)
+                matches.add((channel.index, offset))
+
+        return matches, savings
 
 
 def compress2(data: bytes, min_length: int) -> bytes:
@@ -504,8 +554,8 @@ def compress2(data: bytes, min_length: int) -> bytes:
         # Next, try to substitute it.
         if best_savings > 0:
             (position, length, matches) = best_match
-            print(
-                f"Round {round}: offset 0x{position:x} length {length} matches {len(matches)} places, saving {best_savings} bytes")
+            print(f"Round {round}: offset 0x{position:x} length {length} matches {len(matches)} places, "
+                  f"saving {best_savings} bytes")
             # Calculate the savings per match
             bytes_saved_per_match = length - 3
             # The matches refer to positions before the data is spliced - we adjust them in advance
@@ -600,7 +650,7 @@ def find_matches(needle, haystack, pointers, runs):
             offset += len(needle)
 
 
-def save(data: bytes, filename: str):
+def save(data: bytes, filename: str) -> None:
     # The end format is 20 bytes of pointers to per-channel data.
     # A zero pointer will be used to indicate a channel is not used. TODO
     with open(filename, "wb") as f:
@@ -625,12 +675,11 @@ def convert(filename: str) -> FMLibFile:
     result = FMLibFile()
 
     for command in file.commands():
-        # print(line)
         if type(command) is Wait:
             for channel in result.channels:
                 channel.wait(command.length)
         elif type(command) is LoopPoint:
-            for i in result.channels:
+            for channel in result.channels:
                 channel.add_loop()
         elif type(command) is Ym2413Command:
             if command.register >= 0x10:
@@ -678,6 +727,16 @@ def main():
         print(f)
         f.optimise()
         f.save(f"{sys.argv[2]}.pass2.fmlib")
+        print(f)
+    elif verb == "compress":
+        f = convert(sys.argv[2])
+        f.save(f"{sys.argv[2]}.pass1.fmlib")
+        print(f)
+        f.optimise()
+        f.save(f"{sys.argv[2]}.pass2.fmlib")
+        print(f)
+        f.compress()
+        f.save(f"{sys.argv[2]}.pass3.fmlib")
         print(f)
     else:
         raise Exception(f"Unknown verb \"{verb}\"")
